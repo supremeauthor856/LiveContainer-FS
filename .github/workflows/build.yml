@@ -16,6 +16,9 @@ on:
 jobs:
   build:
     runs-on: macos-latest
+    permissions:
+      issues: write
+      contents: read
 
     steps:
       - name: Checkout repository
@@ -42,7 +45,6 @@ jobs:
           security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
           security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
 
-          # Download Apple CA chain so runner trusts our cert
           curl -s -o $RUNNER_TEMP/AppleWWDRCAG3.cer \
             https://www.apple.com/certificateauthority/AppleWWDRCAG3.cer || true
           curl -s -o $RUNNER_TEMP/AppleWWDRCAG4.cer \
@@ -51,7 +53,6 @@ jobs:
             security import "$cert" -k "$KEYCHAIN_PATH" -A 2>/dev/null || true
           done
 
-          # Decode p12 and convert to legacy format
           echo "$ENTERPRISE_CERT_P12" | tr -d '\n' | base64 --decode \
             > $RUNNER_TEMP/enterprise.p12
           openssl pkcs12 -in $RUNNER_TEMP/enterprise.p12 \
@@ -70,11 +71,8 @@ jobs:
             -S apple-tool:,apple:,codesign: \
             -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
           security list-keychains -d user -s "$KEYCHAIN_PATH" login.keychain
-
-          echo "=== Identities in keychain ==="
           security find-identity -v -p codesigning "$KEYCHAIN_PATH"
 
-          # Decode provisioning profile
           echo "$ENTERPRISE_PROVISIONING_PROFILE" | tr -d '\n' | base64 --decode \
             > $RUNNER_TEMP/enterprise.mobileprovision
 
@@ -87,9 +85,6 @@ jobs:
           TEAM_ID=$(strings $RUNNER_TEMP/enterprise.mobileprovision | \
             grep "TeamIdentifier" -A2 | \
             grep -o '[A-Z0-9]\{10\}' | head -1)
-
-          # FIX A: Use SHA1 fingerprint - always reliable, never empty
-          # This is the fingerprint of the enterprise cert
           CERT_SHA1=$(security find-identity -v -p codesigning "$KEYCHAIN_PATH" \
             | grep "iPhone Distribution" | head -1 | awk '{print $2}')
 
@@ -98,14 +93,9 @@ jobs:
           echo "Team ID:      $TEAM_ID"
           echo "Cert SHA1:    $CERT_SHA1"
 
-          # Verify we got everything - fail fast if any are empty
           if [ -z "$PROFILE_UUID" ] || [ -z "$BUNDLE_ID" ] || \
              [ -z "$TEAM_ID" ] || [ -z "$CERT_SHA1" ]; then
             echo "ERROR: Failed to extract signing info!"
-            echo "PROFILE_UUID='$PROFILE_UUID'"
-            echo "BUNDLE_ID='$BUNDLE_ID'"
-            echo "TEAM_ID='$TEAM_ID'"
-            echo "CERT_SHA1='$CERT_SHA1'"
             exit 1
           fi
 
@@ -113,7 +103,6 @@ jobs:
           cp $RUNNER_TEMP/enterprise.mobileprovision \
             "$HOME/Library/MobileDevice/Provisioning Profiles/$PROFILE_UUID.mobileprovision"
 
-          # Write exact entitlements matching the profile (nothing extra)
           python3 - << PYEOF
           import plistlib
           ents = {
@@ -125,9 +114,6 @@ jobs:
           }
           with open('${RUNNER_TEMP}/entitlements.plist', 'wb') as f:
               plistlib.dump(ents, f)
-          print("Entitlements written:")
-          import subprocess
-          subprocess.run(['cat', '${RUNNER_TEMP}/entitlements.plist'])
           PYEOF
 
           echo "PROFILE_UUID=$PROFILE_UUID"   >> $GITHUB_ENV
@@ -136,11 +122,6 @@ jobs:
           echo "CERT_SHA1=$CERT_SHA1"         >> $GITHUB_ENV
           echo "KEYCHAIN_PATH=$KEYCHAIN_PATH"  >> $GITHUB_ENV
 
-      # ─────────────────────────────────────────────────────────────────
-      # FIX 1: ASSETCATALOG_COMPILER_INCLUDE_ALL_APP_ICONS=NO
-      #   Prevents actool from checking simulator runtimes that aren't
-      #   installed on the runner → fixes the only build error.
-      # ─────────────────────────────────────────────────────────────────
       - name: Build Archive
         run: |
           set -o pipefail
@@ -167,107 +148,100 @@ jobs:
           fi
 
           echo "✅ Build succeeded"
-          echo "=== Archive contents ==="
           find build/LiveContainer.xcarchive/Products -type f | head -30
 
-      - name: Upload Build Logs
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: build-logs
-          path: ${{ runner.temp }}/logs/
-          retention-days: 5
-
-      - name: Package Unsigned IPA
-        if: github.event.inputs.signing_method != 'enterprise'
-        run: |
-          mkdir -p build/Payload
-          cp -r "build/LiveContainer.xcarchive/Products/Applications/LiveContainer.app" \
-            build/Payload/
-          cd build && zip -r LiveContainer.ipa Payload && rm -rf Payload
-          echo "✅ Unsigned IPA:" && ls -lh LiveContainer.ipa
-
-      # ─────────────────────────────────────────────────────────────────
-      # FIX B: Update bundle ID in ALL nested Info.plist files
-      #   LiveProcess.appex has its own Info.plist that must also be
-      #   updated to match the provisioning profile bundle ID.
-      # FIX C: Correct find syntax with \( \) grouping
-      # FIX D: Sort by path depth so deepest items are signed first
-      # ─────────────────────────────────────────────────────────────────
       - name: Re-sign with Enterprise Certificate
         if: github.event.inputs.signing_method == 'enterprise'
         run: |
           APP_PATH="$PWD/build/LiveContainer.xcarchive/Products/Applications/LiveContainer.app"
 
-          echo "=== App structure ==="
-          find "$APP_PATH" -name "*.dylib" -o -name "*.framework" \
-            -o -name "*.appex" | sort
-
-          # Inject provisioning profile into main app
-          cp $RUNNER_TEMP/enterprise.mobileprovision \
-            "$APP_PATH/embedded.mobileprovision"
-
-          # FIX B: Update bundle ID in every Info.plist inside the app
-          # Main app
+          cp $RUNNER_TEMP/enterprise.mobileprovision "$APP_PATH/embedded.mobileprovision"
           /usr/libexec/PlistBuddy -c \
-            "Set :CFBundleIdentifier $BUNDLE_ID" \
-            "$APP_PATH/Info.plist"
-          echo "Main app bundle ID set to: $BUNDLE_ID"
+            "Set :CFBundleIdentifier $BUNDLE_ID" "$APP_PATH/Info.plist"
 
-          # All nested app extensions (.appex) - give them sub-bundle IDs
           find "$APP_PATH" -name "*.appex" | while read appex; do
             APPEX_NAME=$(basename "$appex" .appex)
-            APPEX_BUNDLE_ID="${BUNDLE_ID}.${APPEX_NAME}"
             /usr/libexec/PlistBuddy -c \
-              "Set :CFBundleIdentifier $APPEX_BUNDLE_ID" \
+              "Set :CFBundleIdentifier ${BUNDLE_ID}.${APPEX_NAME}" \
               "$appex/Info.plist" 2>/dev/null || true
-            # Also embed the provisioning profile in the appex
             cp $RUNNER_TEMP/enterprise.mobileprovision \
               "$appex/embedded.mobileprovision" 2>/dev/null || true
-            echo "AppEx $APPEX_NAME bundle ID set to: $APPEX_BUNDLE_ID"
           done
 
-          # FIX C+D: Find all signable items, sort deepest-path first
-          # so we always sign inner items before outer ones
-          echo "=== Signing items (inside-out order) ==="
           find "$APP_PATH" \( -name "*.framework" -o -name "*.dylib" -o -name "*.appex" \) \
             | awk '{ print length, $0 }' | sort -rn | awk '{print $2}' \
             | while read item; do
-                echo "  Signing: $(basename $item)"
-                codesign --force \
-                  --sign "$CERT_SHA1" \
-                  --keychain "$KEYCHAIN_PATH" \
-                  --timestamp=none \
+                codesign --force --sign "$CERT_SHA1" \
+                  --keychain "$KEYCHAIN_PATH" --timestamp=none \
                   "$item" 2>&1
               done
 
-          # Sign the main .app last with entitlements
-          echo "=== Signing main app ==="
-          codesign --force \
-            --sign "$CERT_SHA1" \
+          codesign --force --sign "$CERT_SHA1" \
             --keychain "$KEYCHAIN_PATH" \
             --entitlements $RUNNER_TEMP/entitlements.plist \
-            --timestamp=none \
-            "$APP_PATH" 2>&1
+            --timestamp=none "$APP_PATH"
 
-          echo "=== Verification ==="
           codesign --verify --verbose=2 "$APP_PATH" \
-            && echo "✅ Signature valid" || echo "⚠️ Signature warning (may still work)"
-          codesign -dvv "$APP_PATH" 2>&1 | \
-            grep -E "Authority|TeamIdentifier|Identifier|Format"
+            && echo "✅ Signature valid" || echo "⚠️ Signature warning"
 
-      - name: Package Enterprise IPA
-        if: github.event.inputs.signing_method == 'enterprise'
+      - name: Package IPA
         run: |
           mkdir -p build/Payload
           cp -r "build/LiveContainer.xcarchive/Products/Applications/LiveContainer.app" \
             build/Payload/
           cd build && zip -r LiveContainer.ipa Payload && rm -rf Payload
-          echo "✅ Enterprise IPA:" && ls -lh LiveContainer.ipa
+          echo "✅ IPA ready:" && ls -lh LiveContainer.ipa
 
       - name: Upload IPA
+        if: success()
         uses: actions/upload-artifact@v4
         with:
           name: LiveContainer-${{ github.event.inputs.signing_method || 'enterprise' }}.ipa
           path: build/LiveContainer.ipa
           retention-days: 30
+
+      # ─────────────────────────────────────────────────────────────────
+      # AUTO-ISSUE: If build fails, automatically open a GitHub Issue
+      # with just the error lines so Claude can read it directly.
+      # ─────────────────────────────────────────────────────────────────
+      - name: Auto-report failure as GitHub Issue
+        if: failure()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Extract just the error lines (short, readable)
+          ERRORS=$(grep "error:" $RUNNER_TEMP/logs/build_full.log \
+            | grep -v "^Binary" \
+            | head -40 \
+            | sed 's|/Users/runner/work/LiveContainer-FS/LiveContainer-FS/||g')
+
+          # Get last 20 lines of log for context
+          TAIL=$(tail -20 $RUNNER_TEMP/logs/build_full.log \
+            | sed 's|/Users/runner/work/LiveContainer-FS/LiveContainer-FS/||g')
+
+          RUN_URL="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+          BODY="## ❌ Build Failed — Run #${{ github.run_number }}
+
+          **Run:** $RUN_URL
+          **Signing method:** ${{ github.event.inputs.signing_method }}
+          **Xcode:** 16.2
+
+          ### Errors
+          \`\`\`
+          ${ERRORS}
+          \`\`\`
+
+          ### Last 20 lines
+          \`\`\`
+          ${TAIL}
+          \`\`\`"
+
+          gh issue create \
+            --title "❌ Build #${{ github.run_number }} failed" \
+            --body "$BODY" \
+            --label "bug" \
+            2>/dev/null || \
+          gh issue create \
+            --title "❌ Build #${{ github.run_number }} failed" \
+            --body "$BODY
