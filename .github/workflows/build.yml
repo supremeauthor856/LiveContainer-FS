@@ -7,11 +7,11 @@ on:
       signing_method:
         description: 'Signing method'
         required: true
-        default: 'unsigned'
+        default: 'enterprise'
         type: choice
         options:
-          - unsigned
           - enterprise
+          - unsigned
 
 jobs:
   build:
@@ -54,7 +54,7 @@ jobs:
             -nodes
 
           # Step 2: Re-export as legacy p12 with SHA1 MAC + 3DES encryption
-          # macOS security import requires SHA1 MAC - SHA256 causes "unknown format" error
+          # macOS security import requires SHA1 MAC and legacy 3DES encryption
           openssl pkcs12 \
             -export \
             -in $RUNNER_TEMP/enterprise.pem \
@@ -77,21 +77,29 @@ jobs:
 
           security list-keychains -d user -s "$KEYCHAIN_PATH" login.keychain
 
-          # Install the enterprise provisioning profile
-          mkdir -p ~/Library/MobileDevice/Provisioning\ Profiles
+          # Decode provisioning profile
           echo "$ENTERPRISE_PROVISIONING_PROFILE" | tr -d '\n' | base64 --decode > $RUNNER_TEMP/enterprise.mobileprovision
 
-          # Extract UUID and bundle ID dynamically from the profile
-          PROFILE_UUID=$(strings $RUNNER_TEMP/enterprise.mobileprovision | grep -A1 "UUID" | tail -1 | tr -d '\t ')
-          BUNDLE_ID=$(strings $RUNNER_TEMP/enterprise.mobileprovision | grep "application-identifier" -A1 | tail -1 | tr -d '\t ' | sed 's/.*\.//' | sed 's/<\/string>//')
+          # Extract UUID cleanly using regex (no XML tags)
+          PROFILE_UUID=$(strings $RUNNER_TEMP/enterprise.mobileprovision | \
+            grep -iE "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}" | \
+            grep -oE "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 
+          # Extract full bundle ID cleanly (includes team prefix e.g. N3WP93Z7CM.com.app.name)
+          BUNDLE_ID=$(strings $RUNNER_TEMP/enterprise.mobileprovision | \
+            grep "application-identifier" -A1 | \
+            grep -o '[A-Z0-9]*\.[a-zA-Z0-9.]*' | tail -1)
+
+          echo "Profile UUID: $PROFILE_UUID"
+          echo "Bundle ID: $BUNDLE_ID"
+
+          # Create directory and install provisioning profile
+          mkdir -p "$HOME/Library/MobileDevice/Provisioning Profiles"
           cp $RUNNER_TEMP/enterprise.mobileprovision \
-            ~/Library/MobileDevice/Provisioning\ Profiles/$PROFILE_UUID.mobileprovision
+            "$HOME/Library/MobileDevice/Provisioning Profiles/$PROFILE_UUID.mobileprovision"
 
           echo "PROFILE_UUID=$PROFILE_UUID" >> $GITHUB_ENV
           echo "BUNDLE_ID=$BUNDLE_ID" >> $GITHUB_ENV
-          echo "Installed profile UUID: $PROFILE_UUID"
-          echo "Bundle ID: $BUNDLE_ID"
 
       - name: Build and Archive (Unsigned)
         if: github.event.inputs.signing_method != 'enterprise'
@@ -168,5 +176,5 @@ jobs:
       - name: Upload IPA artifact
         uses: actions/upload-artifact@v4
         with:
-          name: LiveContainer-${{ github.event.inputs.signing_method || 'unsigned' }}.ipa
+          name: LiveContainer-${{ github.event.inputs.signing_method || 'enterprise' }}.ipa
           path: build/LiveContainer.ipa
