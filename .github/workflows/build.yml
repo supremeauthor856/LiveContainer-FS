@@ -1,9 +1,17 @@
 name: iOS Build
 
 on:
-  
   pull_request:
   workflow_dispatch:
+    inputs:
+      signing_method:
+        description: 'Signing method'
+        required: true
+        default: 'unsigned'
+        type: choice
+        options:
+          - unsigned
+          - enterprise
 
 jobs:
   build:
@@ -13,15 +21,53 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          submodules: true  
+          submodules: true
 
       - name: Select Xcode version
         uses: maxim-lobanov/setup-xcode@v1
         with:
           xcode-version: "16.4"
 
+      - name: Import Enterprise Certificate & Profile
+        if: github.event.inputs.signing_method == 'enterprise'
+        env:
+          ENTERPRISE_CERT_P12: ${{ secrets.ENTERPRISE_CERT_P12 }}
+          ENTERPRISE_CERT_PASSWORD: ${{ secrets.ENTERPRISE_CERT_PASSWORD }}
+          ENTERPRISE_PROVISIONING_PROFILE: ${{ secrets.ENTERPRISE_PROVISIONING_PROFILE }}
+        run: |
+          # Create a temporary keychain
+          KEYCHAIN_PATH=$RUNNER_TEMP/build.keychain
+          KEYCHAIN_PASSWORD=$(openssl rand -base64 16)
 
-      - name: Build and Archive
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+
+          # Import the enterprise .p12 certificate
+          echo "$ENTERPRISE_CERT_P12" | base64 --decode > $RUNNER_TEMP/enterprise.p12
+          security import $RUNNER_TEMP/enterprise.p12 \
+            -k "$KEYCHAIN_PATH" \
+            -P "$ENTERPRISE_CERT_PASSWORD" \
+            -T /usr/bin/codesign
+
+          security set-key-partition-list \
+            -S apple-tool:,apple:,codesign: \
+            -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+
+          security list-keychains -d user -s "$KEYCHAIN_PATH" login.keychain
+
+          # Install the enterprise provisioning profile
+          mkdir -p ~/Library/MobileDevice/Provisioning\ Profiles
+          echo "$ENTERPRISE_PROVISIONING_PROFILE" | base64 --decode > $RUNNER_TEMP/enterprise.mobileprovision
+          PROFILE_UUID=$(security cms -D -i $RUNNER_TEMP/enterprise.mobileprovision \
+            | plutil -extract UUID raw -)
+          cp $RUNNER_TEMP/enterprise.mobileprovision \
+            ~/Library/MobileDevice/Provisioning\ Profiles/$PROFILE_UUID.mobileprovision
+
+          echo "PROFILE_UUID=$PROFILE_UUID" >> $GITHUB_ENV
+
+      - name: Build and Archive (Unsigned)
+        if: github.event.inputs.signing_method != 'enterprise'
         run: |
           set -o pipefail
           xcodebuild clean archive \
@@ -31,9 +77,59 @@ jobs:
             -archivePath $PWD/build/LiveContainer.xcarchive \
             -destination "generic/platform=iOS" \
             CODE_SIGN_IDENTITY="" CODE_SIGNING_REQUIRED=NO \
-          | xcpretty
+            | xcpretty
 
-      - name: Create IPA
+      - name: Build and Archive (Enterprise)
+        if: github.event.inputs.signing_method == 'enterprise'
+        run: |
+          set -o pipefail
+          xcodebuild clean archive \
+            -project "LiveContainer.xcodeproj" \
+            -scheme "LiveContainer" \
+            -configuration Release \
+            -archivePath $PWD/build/LiveContainer.xcarchive \
+            -destination "generic/platform=iOS" \
+            CODE_SIGN_STYLE=Manual \
+            PROVISIONING_PROFILE="$PROFILE_UUID" \
+            | xcpretty
+
+      - name: Create Export Options Plist (Enterprise)
+        if: github.event.inputs.signing_method == 'enterprise'
+        run: |
+          cat > $PWD/build/ExportOptions.plist <<EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>method</key>
+            <string>enterprise</string>
+            <key>provisioningProfiles</key>
+            <dict>
+              <key>com.livecontainer.app</key>
+              <string>${PROFILE_UUID}</string>
+            </dict>
+            <key>signingStyle</key>
+            <string>manual</string>
+            <key>stripSwiftSymbols</key>
+            <true/>
+            <key>thinning</key>
+            <string>&lt;none&gt;</string>
+          </dict>
+          </plist>
+          EOF
+
+      - name: Export IPA (Enterprise)
+        if: github.event.inputs.signing_method == 'enterprise'
+        run: |
+          xcodebuild -exportArchive \
+            -archivePath $PWD/build/LiveContainer.xcarchive \
+            -exportPath $PWD/build/export \
+            -exportOptionsPlist $PWD/build/ExportOptions.plist \
+            | xcpretty
+          mv $PWD/build/export/LiveContainer.ipa $PWD/build/LiveContainer.ipa
+
+      - name: Create IPA (Unsigned)
+        if: github.event.inputs.signing_method != 'enterprise'
         run: |
           mkdir -p build/Payload
           cp -r build/LiveContainer.xcarchive/Products/Applications/LiveContainer.app build/Payload/
@@ -46,5 +142,7 @@ jobs:
       - name: Upload IPA artifact
         uses: actions/upload-artifact@v4
         with:
-          name: LiveContainer.ipa
+          name: LiveContainer-${{ github.event.inputs.signing_method || 'unsigned' }}.ipa
           path: build/LiveContainer.ipa
+
+
