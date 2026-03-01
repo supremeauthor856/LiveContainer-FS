@@ -46,19 +46,17 @@ jobs:
           # Decode the p12 (strip line breaks to avoid corruption)
           echo "$ENTERPRISE_CERT_P12" | tr -d '\n' | base64 --decode > $RUNNER_TEMP/enterprise.p12
 
-          # Step 1: Extract cert and key from modern p12 into PEM format
+          # Step 1: Extract cert and key into unencrypted PEM (-nodes removes password)
           openssl pkcs12 \
             -in $RUNNER_TEMP/enterprise.p12 \
             -passin pass:"$ENTERPRISE_CERT_PASSWORD" \
-            -passout pass:"$ENTERPRISE_CERT_PASSWORD" \
             -out $RUNNER_TEMP/enterprise.pem \
             -nodes
 
-          # Step 2: Re-export as legacy p12 that macOS security command can import
+          # Step 2: Re-export as legacy p12 (no -passin because PEM has no password)
           openssl pkcs12 \
             -export \
             -in $RUNNER_TEMP/enterprise.pem \
-            -passin pass:"$ENTERPRISE_CERT_PASSWORD" \
             -passout pass:"$ENTERPRISE_CERT_PASSWORD" \
             -out $RUNNER_TEMP/enterprise_legacy.p12 \
             -keypbe PBE-SHA1-3DES \
@@ -69,7 +67,8 @@ jobs:
           security import $RUNNER_TEMP/enterprise_legacy.p12 \
             -k "$KEYCHAIN_PATH" \
             -P "$ENTERPRISE_CERT_PASSWORD" \
-            -T /usr/bin/codesign
+            -T /usr/bin/codesign \
+            -A
 
           security set-key-partition-list \
             -S apple-tool:,apple:,codesign: \
