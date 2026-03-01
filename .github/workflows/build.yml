@@ -85,13 +85,20 @@ jobs:
             grep -iE "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}" | \
             grep -oE "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 
-          # Extract full bundle ID cleanly (includes team prefix e.g. N3WP93Z7CM.com.app.name)
-          BUNDLE_ID=$(strings $RUNNER_TEMP/enterprise.mobileprovision | \
+          # Extract bundle ID without team prefix (e.g. com.SFn27a.5NDvCv)
+          FULL_APP_ID=$(strings $RUNNER_TEMP/enterprise.mobileprovision | \
             grep "application-identifier" -A1 | \
             grep -o '[A-Z0-9]*\.[a-zA-Z0-9.]*' | tail -1)
+          BUNDLE_ID=$(echo "$FULL_APP_ID" | cut -d'.' -f2-)
+
+          # Extract team ID
+          TEAM_ID=$(strings $RUNNER_TEMP/enterprise.mobileprovision | \
+            grep "TeamIdentifier" -A2 | \
+            grep -o '[A-Z0-9]\{10\}' | head -1)
 
           echo "Profile UUID: $PROFILE_UUID"
           echo "Bundle ID: $BUNDLE_ID"
+          echo "Team ID: $TEAM_ID"
 
           # Create directory and install provisioning profile
           mkdir -p "$HOME/Library/MobileDevice/Provisioning Profiles"
@@ -100,6 +107,7 @@ jobs:
 
           echo "PROFILE_UUID=$PROFILE_UUID" >> $GITHUB_ENV
           echo "BUNDLE_ID=$BUNDLE_ID" >> $GITHUB_ENV
+          echo "TEAM_ID=$TEAM_ID" >> $GITHUB_ENV
 
       - name: Build and Archive (Unsigned)
         if: github.event.inputs.signing_method != 'enterprise'
@@ -111,7 +119,9 @@ jobs:
             -configuration Release \
             -archivePath $PWD/build/LiveContainer.xcarchive \
             -destination "generic/platform=iOS" \
-            CODE_SIGN_IDENTITY="" CODE_SIGNING_REQUIRED=NO
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO
 
       - name: Build and Archive (Enterprise)
         if: github.event.inputs.signing_method == 'enterprise'
@@ -124,7 +134,11 @@ jobs:
             -archivePath $PWD/build/LiveContainer.xcarchive \
             -destination "generic/platform=iOS" \
             CODE_SIGN_STYLE=Manual \
+            CODE_SIGN_IDENTITY="iPhone Distribution" \
+            DEVELOPMENT_TEAM="$TEAM_ID" \
             PROVISIONING_PROFILE="$PROFILE_UUID" \
+            PROVISIONING_PROFILE_SPECIFIER="$PROFILE_UUID" \
+            PRODUCT_BUNDLE_IDENTIFIER="$BUNDLE_ID" \
             | xcpretty
 
       - name: Create Export Options Plist (Enterprise)
@@ -137,11 +151,15 @@ jobs:
           <dict>
             <key>method</key>
             <string>enterprise</string>
+            <key>teamID</key>
+            <string>${TEAM_ID}</string>
             <key>provisioningProfiles</key>
             <dict>
               <key>${BUNDLE_ID}</key>
               <string>${PROFILE_UUID}</string>
             </dict>
+            <key>signingCertificate</key>
+            <string>iPhone Distribution</string>
             <key>signingStyle</key>
             <string>manual</string>
             <key>stripSwiftSymbols</key>
