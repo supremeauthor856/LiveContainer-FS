@@ -143,5 +143,3 @@ jobs:
         with:
           name: LiveContainer-${{ github.event.inputs.signing_method || 'unsigned' }}.ipa
           path: build/LiveContainer.ipa
-
-
