@@ -1,0 +1,41 @@
+name: Build iOS IPA (Unsigned)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Select Xcode
+        run: sudo xcode-select -switch /Applications/Xcode.app
+
+      - name: Show available schemes (debug step)
+        run: xcodebuild -list
+
+      - name: Build archive (no signing)
+        run: |
+          xcodebuild \
+            -workspace LiveContainer.xcworkspace \
+            -scheme LiveContainer \
+            -configuration Release \
+            -destination generic/platform=iOS \
+            CODE_SIGNING_ALLOWED=NO \
+            clean archive \
+            -archivePath $PWD/build/LiveContainer.xcarchive
+
+      - name: Create unsigned IPA
+        run: |
+          mkdir -p build/ipa
+          cd build/LiveContainer.xcarchive/Products/Applications
+          zip -r ../../../ipa/LiveContainer.ipa *.app
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: LiveContainer-Unsigned-IPA
+          path: build/ipa/*.ipa
