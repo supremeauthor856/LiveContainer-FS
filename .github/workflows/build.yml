@@ -46,14 +46,15 @@ jobs:
           # Decode the p12 (strip line breaks to avoid corruption)
           echo "$ENTERPRISE_CERT_P12" | tr -d '\n' | base64 --decode > $RUNNER_TEMP/enterprise.p12
 
-          # Step 1: Extract cert and key into unencrypted PEM (-nodes removes password)
+          # Step 1: Extract cert and key into unencrypted PEM
           openssl pkcs12 \
             -in $RUNNER_TEMP/enterprise.p12 \
             -passin pass:"$ENTERPRISE_CERT_PASSWORD" \
             -out $RUNNER_TEMP/enterprise.pem \
             -nodes
 
-          # Step 2: Re-export as legacy p12 (no -passin because PEM has no password)
+          # Step 2: Re-export as legacy p12 with SHA1 MAC + 3DES encryption
+          # macOS security import requires SHA1 MAC - SHA256 causes "unknown format" error
           openssl pkcs12 \
             -export \
             -in $RUNNER_TEMP/enterprise.pem \
@@ -61,7 +62,7 @@ jobs:
             -out $RUNNER_TEMP/enterprise_legacy.p12 \
             -keypbe PBE-SHA1-3DES \
             -certpbe PBE-SHA1-3DES \
-            -nomac
+            -macalg SHA1
 
           # Import the converted legacy p12 into keychain
           security import $RUNNER_TEMP/enterprise_legacy.p12 \
@@ -76,15 +77,21 @@ jobs:
 
           security list-keychains -d user -s "$KEYCHAIN_PATH" login.keychain
 
-          # Install the enterprise provisioning profile (strip line breaks before decoding)
+          # Install the enterprise provisioning profile
           mkdir -p ~/Library/MobileDevice/Provisioning\ Profiles
           echo "$ENTERPRISE_PROVISIONING_PROFILE" | tr -d '\n' | base64 --decode > $RUNNER_TEMP/enterprise.mobileprovision
-          PROFILE_UUID=$(security cms -D -i $RUNNER_TEMP/enterprise.mobileprovision \
-            | plutil -extract UUID raw -)
+
+          # Extract UUID and bundle ID dynamically from the profile
+          PROFILE_UUID=$(strings $RUNNER_TEMP/enterprise.mobileprovision | grep -A1 "UUID" | tail -1 | tr -d '\t ')
+          BUNDLE_ID=$(strings $RUNNER_TEMP/enterprise.mobileprovision | grep "application-identifier" -A1 | tail -1 | tr -d '\t ' | sed 's/.*\.//' | sed 's/<\/string>//')
+
           cp $RUNNER_TEMP/enterprise.mobileprovision \
             ~/Library/MobileDevice/Provisioning\ Profiles/$PROFILE_UUID.mobileprovision
 
           echo "PROFILE_UUID=$PROFILE_UUID" >> $GITHUB_ENV
+          echo "BUNDLE_ID=$BUNDLE_ID" >> $GITHUB_ENV
+          echo "Installed profile UUID: $PROFILE_UUID"
+          echo "Bundle ID: $BUNDLE_ID"
 
       - name: Build and Archive (Unsigned)
         if: github.event.inputs.signing_method != 'enterprise'
@@ -115,7 +122,7 @@ jobs:
       - name: Create Export Options Plist (Enterprise)
         if: github.event.inputs.signing_method == 'enterprise'
         run: |
-          cat > $PWD/build/ExportOptions.plist <<EOF
+          cat > $PWD/build/ExportOptions.plist << EOF
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
           <plist version="1.0">
@@ -124,7 +131,7 @@ jobs:
             <string>enterprise</string>
             <key>provisioningProfiles</key>
             <dict>
-              <key>com.livecontainer.app</key>
+              <key>${BUNDLE_ID}</key>
               <string>${PROFILE_UUID}</string>
             </dict>
             <key>signingStyle</key>
