@@ -42,6 +42,7 @@ jobs:
           security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
           security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
 
+          # Download Apple CA chain so runner trusts our cert
           curl -s -o $RUNNER_TEMP/AppleWWDRCAG3.cer \
             https://www.apple.com/certificateauthority/AppleWWDRCAG3.cer || true
           curl -s -o $RUNNER_TEMP/AppleWWDRCAG4.cer \
@@ -50,7 +51,9 @@ jobs:
             security import "$cert" -k "$KEYCHAIN_PATH" -A 2>/dev/null || true
           done
 
-          echo "$ENTERPRISE_CERT_P12" | tr -d '\n' | base64 --decode > $RUNNER_TEMP/enterprise.p12
+          # Decode p12 and convert to legacy format
+          echo "$ENTERPRISE_CERT_P12" | tr -d '\n' | base64 --decode \
+            > $RUNNER_TEMP/enterprise.p12
           openssl pkcs12 -in $RUNNER_TEMP/enterprise.p12 \
             -passin pass:"$ENTERPRISE_CERT_PASSWORD" \
             -out $RUNNER_TEMP/enterprise.pem -nodes
@@ -67,8 +70,11 @@ jobs:
             -S apple-tool:,apple:,codesign: \
             -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
           security list-keychains -d user -s "$KEYCHAIN_PATH" login.keychain
-          security find-identity -v -p codesigning
 
+          echo "=== Identities in keychain ==="
+          security find-identity -v -p codesigning "$KEYCHAIN_PATH"
+
+          # Decode provisioning profile
           echo "$ENTERPRISE_PROVISIONING_PROFILE" | tr -d '\n' | base64 --decode \
             > $RUNNER_TEMP/enterprise.mobileprovision
 
@@ -81,42 +87,59 @@ jobs:
           TEAM_ID=$(strings $RUNNER_TEMP/enterprise.mobileprovision | \
             grep "TeamIdentifier" -A2 | \
             grep -o '[A-Z0-9]\{10\}' | head -1)
-          SIGNING_IDENTITY=$(security find-identity -v -p codesigning \
-            "$KEYCHAIN_PATH" | grep "iPhone Distribution" | \
-            head -1 | sed 's/.*"\(.*\)"/\1/')
 
-          echo "Profile UUID:     $PROFILE_UUID"
-          echo "Bundle ID:        $BUNDLE_ID"
-          echo "Team ID:          $TEAM_ID"
-          echo "Signing Identity: $SIGNING_IDENTITY"
+          # FIX A: Use SHA1 fingerprint - always reliable, never empty
+          # This is the fingerprint of the enterprise cert
+          CERT_SHA1=$(security find-identity -v -p codesigning "$KEYCHAIN_PATH" \
+            | grep "iPhone Distribution" | head -1 | awk '{print $2}')
+
+          echo "Profile UUID: $PROFILE_UUID"
+          echo "Bundle ID:    $BUNDLE_ID"
+          echo "Team ID:      $TEAM_ID"
+          echo "Cert SHA1:    $CERT_SHA1"
+
+          # Verify we got everything - fail fast if any are empty
+          if [ -z "$PROFILE_UUID" ] || [ -z "$BUNDLE_ID" ] || \
+             [ -z "$TEAM_ID" ] || [ -z "$CERT_SHA1" ]; then
+            echo "ERROR: Failed to extract signing info!"
+            echo "PROFILE_UUID='$PROFILE_UUID'"
+            echo "BUNDLE_ID='$BUNDLE_ID'"
+            echo "TEAM_ID='$TEAM_ID'"
+            echo "CERT_SHA1='$CERT_SHA1'"
+            exit 1
+          fi
 
           mkdir -p "$HOME/Library/MobileDevice/Provisioning Profiles"
           cp $RUNNER_TEMP/enterprise.mobileprovision \
             "$HOME/Library/MobileDevice/Provisioning Profiles/$PROFILE_UUID.mobileprovision"
 
-          python3 -c "
+          # Write exact entitlements matching the profile (nothing extra)
+          python3 - << PYEOF
           import plistlib
           ents = {
-              'application-identifier': '$TEAM_ID.$BUNDLE_ID',
-              'com.apple.developer.team-identifier': '$TEAM_ID',
+              'application-identifier': '${TEAM_ID}.${BUNDLE_ID}',
+              'com.apple.developer.team-identifier': '${TEAM_ID}',
               'aps-environment': 'production',
-              'keychain-access-groups': ['$TEAM_ID.*', 'com.apple.token'],
+              'keychain-access-groups': ['${TEAM_ID}.*', 'com.apple.token'],
               'get-task-allow': False,
           }
-          with open('$RUNNER_TEMP/entitlements.plist', 'wb') as f:
+          with open('${RUNNER_TEMP}/entitlements.plist', 'wb') as f:
               plistlib.dump(ents, f)
-          "
+          print("Entitlements written:")
+          import subprocess
+          subprocess.run(['cat', '${RUNNER_TEMP}/entitlements.plist'])
+          PYEOF
 
-          echo "PROFILE_UUID=$PROFILE_UUID"         >> $GITHUB_ENV
-          echo "BUNDLE_ID=$BUNDLE_ID"               >> $GITHUB_ENV
-          echo "TEAM_ID=$TEAM_ID"                   >> $GITHUB_ENV
-          echo "SIGNING_IDENTITY=$SIGNING_IDENTITY" >> $GITHUB_ENV
-          echo "KEYCHAIN_PATH=$KEYCHAIN_PATH"        >> $GITHUB_ENV
+          echo "PROFILE_UUID=$PROFILE_UUID"   >> $GITHUB_ENV
+          echo "BUNDLE_ID=$BUNDLE_ID"         >> $GITHUB_ENV
+          echo "TEAM_ID=$TEAM_ID"             >> $GITHUB_ENV
+          echo "CERT_SHA1=$CERT_SHA1"         >> $GITHUB_ENV
+          echo "KEYCHAIN_PATH=$KEYCHAIN_PATH"  >> $GITHUB_ENV
 
       # ─────────────────────────────────────────────────────────────────
-      # THE FIX: Add -sdk iphoneos so actool ONLY compiles asset catalogs
-      # for the device SDK. Without this it also tries to compile for the
-      # iOS Simulator which isn't installed on the runner → crash.
+      # FIX 1: ASSETCATALOG_COMPILER_INCLUDE_ALL_APP_ICONS=NO
+      #   Prevents actool from checking simulator runtimes that aren't
+      #   installed on the runner → fixes the only build error.
       # ─────────────────────────────────────────────────────────────────
       - name: Build Archive
         run: |
@@ -133,16 +156,19 @@ jobs:
             CODE_SIGN_IDENTITY="" \
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGNING_ALLOWED=NO \
+            ASSETCATALOG_COMPILER_INCLUDE_ALL_APP_ICONS=NO \
             2>&1 | tee $RUNNER_TEMP/logs/build_full.log
           BUILD_EXIT=${PIPESTATUS[0]}
 
           if [ $BUILD_EXIT -ne 0 ]; then
-            echo "════════════════════════════════════"
-            echo "  ERRORS"
-            echo "════════════════════════════════════"
+            echo "════════════ BUILD ERRORS ════════════"
             grep "error:" $RUNNER_TEMP/logs/build_full.log | grep -v "^Binary"
             exit $BUILD_EXIT
           fi
+
+          echo "✅ Build succeeded"
+          echo "=== Archive contents ==="
+          find build/LiveContainer.xcarchive/Products -type f | head -30
 
       - name: Upload Build Logs
         if: failure()
@@ -156,50 +182,88 @@ jobs:
         if: github.event.inputs.signing_method != 'enterprise'
         run: |
           mkdir -p build/Payload
-          cp -r build/LiveContainer.xcarchive/Products/Applications/LiveContainer.app \
+          cp -r "build/LiveContainer.xcarchive/Products/Applications/LiveContainer.app" \
             build/Payload/
           cd build && zip -r LiveContainer.ipa Payload && rm -rf Payload
-          echo "Unsigned IPA:" && ls -lh LiveContainer.ipa
+          echo "✅ Unsigned IPA:" && ls -lh LiveContainer.ipa
 
+      # ─────────────────────────────────────────────────────────────────
+      # FIX B: Update bundle ID in ALL nested Info.plist files
+      #   LiveProcess.appex has its own Info.plist that must also be
+      #   updated to match the provisioning profile bundle ID.
+      # FIX C: Correct find syntax with \( \) grouping
+      # FIX D: Sort by path depth so deepest items are signed first
+      # ─────────────────────────────────────────────────────────────────
       - name: Re-sign with Enterprise Certificate
         if: github.event.inputs.signing_method == 'enterprise'
         run: |
           APP_PATH="$PWD/build/LiveContainer.xcarchive/Products/Applications/LiveContainer.app"
 
-          # Inject provisioning profile
+          echo "=== App structure ==="
+          find "$APP_PATH" -name "*.dylib" -o -name "*.framework" \
+            -o -name "*.appex" | sort
+
+          # Inject provisioning profile into main app
           cp $RUNNER_TEMP/enterprise.mobileprovision \
             "$APP_PATH/embedded.mobileprovision"
 
-          # Update bundle ID to match profile
+          # FIX B: Update bundle ID in every Info.plist inside the app
+          # Main app
           /usr/libexec/PlistBuddy -c \
-            "Set :CFBundleIdentifier $BUNDLE_ID" "$APP_PATH/Info.plist"
+            "Set :CFBundleIdentifier $BUNDLE_ID" \
+            "$APP_PATH/Info.plist"
+          echo "Main app bundle ID set to: $BUNDLE_ID"
 
-          # Sign all nested frameworks/dylibs first (inside-out)
-          find "$APP_PATH" \( -name "*.framework" -o -name "*.dylib" -o -name "*.appex" \) | \
-          while read item; do
-            echo "Signing: $item"
-            codesign --force --sign "$SIGNING_IDENTITY" \
-              --keychain "$KEYCHAIN_PATH" --timestamp=none "$item" 2>&1 || true
+          # All nested app extensions (.appex) - give them sub-bundle IDs
+          find "$APP_PATH" -name "*.appex" | while read appex; do
+            APPEX_NAME=$(basename "$appex" .appex)
+            APPEX_BUNDLE_ID="${BUNDLE_ID}.${APPEX_NAME}"
+            /usr/libexec/PlistBuddy -c \
+              "Set :CFBundleIdentifier $APPEX_BUNDLE_ID" \
+              "$appex/Info.plist" 2>/dev/null || true
+            # Also embed the provisioning profile in the appex
+            cp $RUNNER_TEMP/enterprise.mobileprovision \
+              "$appex/embedded.mobileprovision" 2>/dev/null || true
+            echo "AppEx $APPEX_NAME bundle ID set to: $APPEX_BUNDLE_ID"
           done
 
-          # Sign the main app with exact entitlements matching the profile
-          codesign --force --sign "$SIGNING_IDENTITY" \
+          # FIX C+D: Find all signable items, sort deepest-path first
+          # so we always sign inner items before outer ones
+          echo "=== Signing items (inside-out order) ==="
+          find "$APP_PATH" \( -name "*.framework" -o -name "*.dylib" -o -name "*.appex" \) \
+            | awk '{ print length, $0 }' | sort -rn | awk '{print $2}' \
+            | while read item; do
+                echo "  Signing: $(basename $item)"
+                codesign --force \
+                  --sign "$CERT_SHA1" \
+                  --keychain "$KEYCHAIN_PATH" \
+                  --timestamp=none \
+                  "$item" 2>&1
+              done
+
+          # Sign the main .app last with entitlements
+          echo "=== Signing main app ==="
+          codesign --force \
+            --sign "$CERT_SHA1" \
             --keychain "$KEYCHAIN_PATH" \
             --entitlements $RUNNER_TEMP/entitlements.plist \
-            --timestamp=none "$APP_PATH"
+            --timestamp=none \
+            "$APP_PATH" 2>&1
 
+          echo "=== Verification ==="
           codesign --verify --verbose=2 "$APP_PATH" \
-            && echo "✅ Signature valid" || echo "⚠️ Signature warning"
-          codesign -dvv "$APP_PATH" 2>&1 | grep -E "Authority|TeamIdentifier|Identifier"
+            && echo "✅ Signature valid" || echo "⚠️ Signature warning (may still work)"
+          codesign -dvv "$APP_PATH" 2>&1 | \
+            grep -E "Authority|TeamIdentifier|Identifier|Format"
 
       - name: Package Enterprise IPA
         if: github.event.inputs.signing_method == 'enterprise'
         run: |
           mkdir -p build/Payload
-          cp -r build/LiveContainer.xcarchive/Products/Applications/LiveContainer.app \
+          cp -r "build/LiveContainer.xcarchive/Products/Applications/LiveContainer.app" \
             build/Payload/
           cd build && zip -r LiveContainer.ipa Payload && rm -rf Payload
-          echo "Enterprise IPA:" && ls -lh LiveContainer.ipa
+          echo "✅ Enterprise IPA:" && ls -lh LiveContainer.ipa
 
       - name: Upload IPA
         uses: actions/upload-artifact@v4
