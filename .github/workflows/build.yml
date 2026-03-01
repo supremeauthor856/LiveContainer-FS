@@ -77,19 +77,22 @@ jobs:
 
           security list-keychains -d user -s "$KEYCHAIN_PATH" login.keychain
 
+          # Verify the identity is available
+          echo "Available signing identities:"
+          security find-identity -v -p codesigning "$KEYCHAIN_PATH"
+
           # Decode provisioning profile
           echo "$ENTERPRISE_PROVISIONING_PROFILE" | tr -d '\n' | base64 --decode > $RUNNER_TEMP/enterprise.mobileprovision
 
-          # Extract UUID cleanly using regex (no XML tags)
+          # Extract UUID cleanly using regex
           PROFILE_UUID=$(strings $RUNNER_TEMP/enterprise.mobileprovision | \
             grep -iE "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}" | \
             grep -oE "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 
-          # Extract bundle ID without team prefix (e.g. com.SFn27a.5NDvCv)
-          FULL_APP_ID=$(strings $RUNNER_TEMP/enterprise.mobileprovision | \
+          # Extract bundle ID without team prefix
+          BUNDLE_ID=$(strings $RUNNER_TEMP/enterprise.mobileprovision | \
             grep "application-identifier" -A1 | \
-            grep -o '[A-Z0-9]*\.[a-zA-Z0-9.]*' | tail -1)
-          BUNDLE_ID=$(echo "$FULL_APP_ID" | cut -d'.' -f2-)
+            grep -o '[A-Z0-9]*\.[a-zA-Z0-9.]*' | tail -1 | cut -d'.' -f2-)
 
           # Extract team ID
           TEAM_ID=$(strings $RUNNER_TEMP/enterprise.mobileprovision | \
@@ -126,6 +129,7 @@ jobs:
       - name: Build and Archive (Enterprise)
         if: github.event.inputs.signing_method == 'enterprise'
         run: |
+          # Run WITHOUT xcpretty so full error output is visible if it fails
           set -o pipefail
           xcodebuild clean archive \
             -project "LiveContainer.xcodeproj" \
@@ -133,13 +137,15 @@ jobs:
             -configuration Release \
             -archivePath $PWD/build/LiveContainer.xcarchive \
             -destination "generic/platform=iOS" \
+            -allowProvisioningUpdates \
             CODE_SIGN_STYLE=Manual \
             CODE_SIGN_IDENTITY="iPhone Distribution" \
+            CODE_SIGNING_REQUIRED=YES \
+            CODE_SIGNING_ALLOWED=YES \
             DEVELOPMENT_TEAM="$TEAM_ID" \
             PROVISIONING_PROFILE="$PROFILE_UUID" \
             PROVISIONING_PROFILE_SPECIFIER="$PROFILE_UUID" \
-            PRODUCT_BUNDLE_IDENTIFIER="$BUNDLE_ID" \
-            | xcpretty
+            PRODUCT_BUNDLE_IDENTIFIER="$BUNDLE_ID"
 
       - name: Create Export Options Plist (Enterprise)
         if: github.event.inputs.signing_method == 'enterprise'
@@ -176,8 +182,7 @@ jobs:
           xcodebuild -exportArchive \
             -archivePath $PWD/build/LiveContainer.xcarchive \
             -exportPath $PWD/build/export \
-            -exportOptionsPlist $PWD/build/ExportOptions.plist \
-            | xcpretty
+            -exportOptionsPlist $PWD/build/ExportOptions.plist
           mv $PWD/build/export/LiveContainer.ipa $PWD/build/LiveContainer.ipa
 
       - name: Create IPA (Unsigned)
