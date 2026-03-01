@@ -7,7 +7,7 @@ on:
       signing_method:
         description: 'Signing method'
         required: true
-        default: 'unsigned'
+        default: 'enterprise'
         type: choice
         options:
           - unsigned
@@ -46,14 +46,16 @@ jobs:
           # Decode the p12 (strip line breaks to avoid corruption)
           echo "$ENTERPRISE_CERT_P12" | tr -d '\n' | base64 --decode > $RUNNER_TEMP/enterprise.p12
 
-          # Convert modern AES-256 encrypted p12 to legacy format
-          # macOS security command only supports the older legacy encryption format
+          # Convert modern AES-256 encrypted p12 to legacy format compatible
+          # with macOS security command (using flags that work on all OpenSSL versions)
           openssl pkcs12 \
             -in $RUNNER_TEMP/enterprise.p12 \
             -passin pass:"$ENTERPRISE_CERT_PASSWORD" \
             -passout pass:"$ENTERPRISE_CERT_PASSWORD" \
             -out $RUNNER_TEMP/enterprise_legacy.p12 \
-            -legacy
+            -keypbe PBE-SHA1-3DES \
+            -certpbe PBE-SHA1-3DES \
+            -nomac
 
           # Import the converted legacy p12 into keychain
           security import $RUNNER_TEMP/enterprise_legacy.p12 \
