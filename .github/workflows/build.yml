@@ -21,16 +21,13 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          submodules: true
+          submodules: recursive
 
       - name: Select Xcode version
         uses: maxim-lobanov/setup-xcode@v1
         with:
           xcode-version: "16.2"
 
-      # ─────────────────────────────────────────────────────────────────
-      # STEP 1: Import certificate and provisioning profile
-      # ─────────────────────────────────────────────────────────────────
       - name: Import Enterprise Certificate & Profile
         if: github.event.inputs.signing_method == 'enterprise'
         env:
@@ -45,27 +42,18 @@ jobs:
           security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
           security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
 
-          # Download Apple CA certs so the runner trusts our enterprise cert
           curl -s -o $RUNNER_TEMP/AppleWWDRCAG3.cer \
             https://www.apple.com/certificateauthority/AppleWWDRCAG3.cer || true
           curl -s -o $RUNNER_TEMP/AppleWWDRCAG4.cer \
             https://www.apple.com/certificateauthority/AppleWWDRCAG4.cer || true
-          curl -s -o $RUNNER_TEMP/AppleRootCA.cer \
-            https://www.apple.com/appleca/AppleIncRootCertificate.cer || true
-
           for cert in $RUNNER_TEMP/Apple*.cer; do
             security import "$cert" -k "$KEYCHAIN_PATH" -A 2>/dev/null || true
           done
 
-          # Decode and convert p12 to legacy format macOS can import
-          echo "$ENTERPRISE_CERT_P12" | tr -d '\n' | base64 --decode \
-            > $RUNNER_TEMP/enterprise.p12
-
-          openssl pkcs12 \
-            -in $RUNNER_TEMP/enterprise.p12 \
+          echo "$ENTERPRISE_CERT_P12" | tr -d '\n' | base64 --decode > $RUNNER_TEMP/enterprise.p12
+          openssl pkcs12 -in $RUNNER_TEMP/enterprise.p12 \
             -passin pass:"$ENTERPRISE_CERT_PASSWORD" \
             -out $RUNNER_TEMP/enterprise.pem -nodes
-
           openssl pkcs12 -export \
             -in $RUNNER_TEMP/enterprise.pem \
             -passout pass:"$ENTERPRISE_CERT_PASSWORD" \
@@ -73,50 +61,33 @@ jobs:
             -keypbe PBE-SHA1-3DES -certpbe PBE-SHA1-3DES -macalg SHA1
 
           security import $RUNNER_TEMP/enterprise_legacy.p12 \
-            -k "$KEYCHAIN_PATH" \
-            -P "$ENTERPRISE_CERT_PASSWORD" \
+            -k "$KEYCHAIN_PATH" -P "$ENTERPRISE_CERT_PASSWORD" \
             -T /usr/bin/codesign -A
-
           security set-key-partition-list \
             -S apple-tool:,apple:,codesign: \
             -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
-
           security list-keychains -d user -s "$KEYCHAIN_PATH" login.keychain
 
-          echo "=== Signing identities available ==="
-          security find-identity -v -p codesigning
-
-          # Decode provisioning profile
           echo "$ENTERPRISE_PROVISIONING_PROFILE" | tr -d '\n' | base64 --decode \
             > $RUNNER_TEMP/enterprise.mobileprovision
 
           PROFILE_UUID=$(strings $RUNNER_TEMP/enterprise.mobileprovision | \
             grep -iE "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}" | \
             grep -oE "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
-
           BUNDLE_ID=$(strings $RUNNER_TEMP/enterprise.mobileprovision | \
             grep "application-identifier" -A1 | \
             grep -o '[A-Z0-9]*\.[a-zA-Z0-9.]*' | tail -1 | cut -d'.' -f2-)
-
           TEAM_ID=$(strings $RUNNER_TEMP/enterprise.mobileprovision | \
             grep "TeamIdentifier" -A2 | \
             grep -o '[A-Z0-9]\{10\}' | head -1)
-
-          # Get the full signing identity name from the cert
           SIGNING_IDENTITY=$(security find-identity -v -p codesigning \
             "$KEYCHAIN_PATH" | grep "iPhone Distribution" | \
             head -1 | sed 's/.*"\(.*\)"/\1/')
-
-          echo "Profile UUID:     $PROFILE_UUID"
-          echo "Bundle ID:        $BUNDLE_ID"
-          echo "Team ID:          $TEAM_ID"
-          echo "Signing Identity: $SIGNING_IDENTITY"
 
           mkdir -p "$HOME/Library/MobileDevice/Provisioning Profiles"
           cp $RUNNER_TEMP/enterprise.mobileprovision \
             "$HOME/Library/MobileDevice/Provisioning Profiles/$PROFILE_UUID.mobileprovision"
 
-          # Write the exact entitlements our profile supports - nothing more
           python3 -c "
           import plistlib
           ents = {
@@ -136,15 +107,11 @@ jobs:
           echo "SIGNING_IDENTITY=$SIGNING_IDENTITY" >> $GITHUB_ENV
           echo "KEYCHAIN_PATH=$KEYCHAIN_PATH"        >> $GITHUB_ENV
 
-      # ─────────────────────────────────────────────────────────────────
-      # STEP 2: Build UNSIGNED - bypass ALL Xcode signing configuration.
-      # This avoids every "conflicting provisioning", "missing profile",
-      # "invalid certificate", "missing entitlement" error completely.
-      # We will sign manually AFTER the build in Step 3.
-      # ─────────────────────────────────────────────────────────────────
       - name: Build Archive (Unsigned)
         run: |
           set -o pipefail
+          mkdir -p $RUNNER_TEMP/logs
+
           xcodebuild clean archive \
             -project "LiveContainer.xcodeproj" \
             -scheme "LiveContainer" \
@@ -154,85 +121,66 @@ jobs:
             CODE_SIGN_IDENTITY="" \
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGNING_ALLOWED=NO \
-            AD_HOC_CODE_SIGNING_ALLOWED=YES
+            2>&1 | tee $RUNNER_TEMP/logs/build_full.log
+          BUILD_EXIT=${PIPESTATUS[0]}
 
-      # ─────────────────────────────────────────────────────────────────
-      # STEP 3a: Package as plain unsigned IPA (if unsigned mode)
-      # ─────────────────────────────────────────────────────────────────
+          # Save just the errors to a separate small file
+          grep -E "error:|warning:|note:" $RUNNER_TEMP/logs/build_full.log \
+            | grep "error:" \
+            > $RUNNER_TEMP/logs/errors_only.txt 2>/dev/null || true
+
+          echo "=== ERRORS ONLY ===" 
+          cat $RUNNER_TEMP/logs/errors_only.txt
+
+          exit $BUILD_EXIT
+
+      # Always upload logs even if build fails
+      - name: Upload Build Logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs
+          path: ${{ runner.temp }}/logs/
+          retention-days: 5
+
       - name: Package Unsigned IPA
-        if: github.event.inputs.signing_method != 'enterprise'
+        if: github.event.inputs.signing_method != 'enterprise' && success()
         run: |
           mkdir -p build/Payload
           cp -r build/LiveContainer.xcarchive/Products/Applications/LiveContainer.app \
             build/Payload/
-          cd build
-          zip -r LiveContainer.ipa Payload
-          rm -rf Payload
-          echo "Unsigned IPA created:"
+          cd build && zip -r LiveContainer.ipa Payload && rm -rf Payload
           ls -lh LiveContainer.ipa
 
-      # ─────────────────────────────────────────────────────────────────
-      # STEP 3b: Manually re-sign the .app with enterprise cert + profile
-      # This is the same approach AltStore/Sideloadly use and works
-      # regardless of how the Xcode project is configured.
-      # ─────────────────────────────────────────────────────────────────
       - name: Re-sign with Enterprise Certificate
-        if: github.event.inputs.signing_method == 'enterprise'
+        if: github.event.inputs.signing_method == 'enterprise' && success()
         run: |
           APP_PATH="$PWD/build/LiveContainer.xcarchive/Products/Applications/LiveContainer.app"
-
-          echo "=== App path ==="
-          ls "$APP_PATH"
-
-          # Inject the provisioning profile into the .app bundle
-          cp $RUNNER_TEMP/enterprise.mobileprovision \
-            "$APP_PATH/embedded.mobileprovision"
-
-          # Update the bundle ID in Info.plist to match profile
+          cp $RUNNER_TEMP/enterprise.mobileprovision "$APP_PATH/embedded.mobileprovision"
           /usr/libexec/PlistBuddy -c \
-            "Set :CFBundleIdentifier $BUNDLE_ID" \
-            "$APP_PATH/Info.plist"
-
-          # Sign all frameworks and dylibs FIRST (inside-out signing)
-          echo "=== Signing nested frameworks and dylibs ==="
-          find "$APP_PATH" -name "*.framework" -o -name "*.dylib" -o -name "*.appex" | \
+            "Set :CFBundleIdentifier $BUNDLE_ID" "$APP_PATH/Info.plist"
+          find "$APP_PATH" \( -name "*.framework" -o -name "*.dylib" -o -name "*.appex" \) | \
           while read item; do
-            echo "  Signing: $item"
             codesign --force --sign "$SIGNING_IDENTITY" \
-              --keychain "$KEYCHAIN_PATH" \
-              --timestamp=none \
-              "$item" 2>&1 || true
+              --keychain "$KEYCHAIN_PATH" --timestamp=none "$item" 2>&1 || true
           done
-
-          # Sign the main app binary with our entitlements
-          echo "=== Signing main app ==="
           codesign --force --sign "$SIGNING_IDENTITY" \
             --keychain "$KEYCHAIN_PATH" \
             --entitlements $RUNNER_TEMP/entitlements.plist \
-            --timestamp=none \
-            "$APP_PATH"
-
-          # Verify the signature
-          echo "=== Verifying signature ==="
-          codesign --verify --verbose=2 "$APP_PATH" && echo "✅ Signature valid" \
-            || echo "⚠️  Signature verification warning (may still work)"
-
-          echo "=== Signing identity used ==="
-          codesign -dvv "$APP_PATH" 2>&1 | grep -E "Authority|TeamIdentifier|Identifier"
+            --timestamp=none "$APP_PATH"
+          codesign --verify --verbose=2 "$APP_PATH" && echo "✅ Signed OK" || echo "⚠️ Warning"
 
       - name: Package Enterprise IPA
-        if: github.event.inputs.signing_method == 'enterprise'
+        if: github.event.inputs.signing_method == 'enterprise' && success()
         run: |
           mkdir -p build/Payload
           cp -r build/LiveContainer.xcarchive/Products/Applications/LiveContainer.app \
             build/Payload/
-          cd build
-          zip -r LiveContainer.ipa Payload
-          rm -rf Payload
-          echo "Enterprise IPA created:"
+          cd build && zip -r LiveContainer.ipa Payload && rm -rf Payload
           ls -lh LiveContainer.ipa
 
       - name: Upload IPA artifact
+        if: success()
         uses: actions/upload-artifact@v4
         with:
           name: LiveContainer-${{ github.event.inputs.signing_method || 'enterprise' }}.ipa
