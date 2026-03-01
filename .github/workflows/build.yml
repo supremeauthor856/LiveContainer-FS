@@ -67,6 +67,7 @@ jobs:
             -S apple-tool:,apple:,codesign: \
             -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
           security list-keychains -d user -s "$KEYCHAIN_PATH" login.keychain
+          security find-identity -v -p codesigning
 
           echo "$ENTERPRISE_PROVISIONING_PROFILE" | tr -d '\n' | base64 --decode \
             > $RUNNER_TEMP/enterprise.mobileprovision
@@ -83,6 +84,11 @@ jobs:
           SIGNING_IDENTITY=$(security find-identity -v -p codesigning \
             "$KEYCHAIN_PATH" | grep "iPhone Distribution" | \
             head -1 | sed 's/.*"\(.*\)"/\1/')
+
+          echo "Profile UUID:     $PROFILE_UUID"
+          echo "Bundle ID:        $BUNDLE_ID"
+          echo "Team ID:          $TEAM_ID"
+          echo "Signing Identity: $SIGNING_IDENTITY"
 
           mkdir -p "$HOME/Library/MobileDevice/Provisioning Profiles"
           cp $RUNNER_TEMP/enterprise.mobileprovision \
@@ -107,7 +113,12 @@ jobs:
           echo "SIGNING_IDENTITY=$SIGNING_IDENTITY" >> $GITHUB_ENV
           echo "KEYCHAIN_PATH=$KEYCHAIN_PATH"        >> $GITHUB_ENV
 
-      - name: Build Archive (Unsigned)
+      # ─────────────────────────────────────────────────────────────────
+      # THE FIX: Add -sdk iphoneos so actool ONLY compiles asset catalogs
+      # for the device SDK. Without this it also tries to compile for the
+      # iOS Simulator which isn't installed on the runner → crash.
+      # ─────────────────────────────────────────────────────────────────
+      - name: Build Archive
         run: |
           set -o pipefail
           mkdir -p $RUNNER_TEMP/logs
@@ -116,6 +127,7 @@ jobs:
             -project "LiveContainer.xcodeproj" \
             -scheme "LiveContainer" \
             -configuration Release \
+            -sdk iphoneos \
             -archivePath $PWD/build/LiveContainer.xcarchive \
             -destination "generic/platform=iOS" \
             CODE_SIGN_IDENTITY="" \
@@ -124,19 +136,16 @@ jobs:
             2>&1 | tee $RUNNER_TEMP/logs/build_full.log
           BUILD_EXIT=${PIPESTATUS[0]}
 
-          # Save just the errors to a separate small file
-          grep -E "error:|warning:|note:" $RUNNER_TEMP/logs/build_full.log \
-            | grep "error:" \
-            > $RUNNER_TEMP/logs/errors_only.txt 2>/dev/null || true
+          if [ $BUILD_EXIT -ne 0 ]; then
+            echo "════════════════════════════════════"
+            echo "  ERRORS"
+            echo "════════════════════════════════════"
+            grep "error:" $RUNNER_TEMP/logs/build_full.log | grep -v "^Binary"
+            exit $BUILD_EXIT
+          fi
 
-          echo "=== ERRORS ONLY ===" 
-          cat $RUNNER_TEMP/logs/errors_only.txt
-
-          exit $BUILD_EXIT
-
-      # Always upload logs even if build fails
       - name: Upload Build Logs
-        if: always()
+        if: failure()
         uses: actions/upload-artifact@v4
         with:
           name: build-logs
@@ -144,43 +153,55 @@ jobs:
           retention-days: 5
 
       - name: Package Unsigned IPA
-        if: github.event.inputs.signing_method != 'enterprise' && success()
+        if: github.event.inputs.signing_method != 'enterprise'
         run: |
           mkdir -p build/Payload
           cp -r build/LiveContainer.xcarchive/Products/Applications/LiveContainer.app \
             build/Payload/
           cd build && zip -r LiveContainer.ipa Payload && rm -rf Payload
-          ls -lh LiveContainer.ipa
+          echo "Unsigned IPA:" && ls -lh LiveContainer.ipa
 
       - name: Re-sign with Enterprise Certificate
-        if: github.event.inputs.signing_method == 'enterprise' && success()
+        if: github.event.inputs.signing_method == 'enterprise'
         run: |
           APP_PATH="$PWD/build/LiveContainer.xcarchive/Products/Applications/LiveContainer.app"
-          cp $RUNNER_TEMP/enterprise.mobileprovision "$APP_PATH/embedded.mobileprovision"
+
+          # Inject provisioning profile
+          cp $RUNNER_TEMP/enterprise.mobileprovision \
+            "$APP_PATH/embedded.mobileprovision"
+
+          # Update bundle ID to match profile
           /usr/libexec/PlistBuddy -c \
             "Set :CFBundleIdentifier $BUNDLE_ID" "$APP_PATH/Info.plist"
+
+          # Sign all nested frameworks/dylibs first (inside-out)
           find "$APP_PATH" \( -name "*.framework" -o -name "*.dylib" -o -name "*.appex" \) | \
           while read item; do
+            echo "Signing: $item"
             codesign --force --sign "$SIGNING_IDENTITY" \
               --keychain "$KEYCHAIN_PATH" --timestamp=none "$item" 2>&1 || true
           done
+
+          # Sign the main app with exact entitlements matching the profile
           codesign --force --sign "$SIGNING_IDENTITY" \
             --keychain "$KEYCHAIN_PATH" \
             --entitlements $RUNNER_TEMP/entitlements.plist \
             --timestamp=none "$APP_PATH"
-          codesign --verify --verbose=2 "$APP_PATH" && echo "✅ Signed OK" || echo "⚠️ Warning"
+
+          codesign --verify --verbose=2 "$APP_PATH" \
+            && echo "✅ Signature valid" || echo "⚠️ Signature warning"
+          codesign -dvv "$APP_PATH" 2>&1 | grep -E "Authority|TeamIdentifier|Identifier"
 
       - name: Package Enterprise IPA
-        if: github.event.inputs.signing_method == 'enterprise' && success()
+        if: github.event.inputs.signing_method == 'enterprise'
         run: |
           mkdir -p build/Payload
           cp -r build/LiveContainer.xcarchive/Products/Applications/LiveContainer.app \
             build/Payload/
           cd build && zip -r LiveContainer.ipa Payload && rm -rf Payload
-          ls -lh LiveContainer.ipa
+          echo "Enterprise IPA:" && ls -lh LiveContainer.ipa
 
-      - name: Upload IPA artifact
-        if: success()
+      - name: Upload IPA
         uses: actions/upload-artifact@v4
         with:
           name: LiveContainer-${{ github.event.inputs.signing_method || 'enterprise' }}.ipa
