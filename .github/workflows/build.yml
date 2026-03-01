@@ -43,9 +43,20 @@ jobs:
           security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
           security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
 
-          # Import the enterprise .p12 certificate (strip line breaks before decoding)
+          # Decode the p12 (strip line breaks to avoid corruption)
           echo "$ENTERPRISE_CERT_P12" | tr -d '\n' | base64 --decode > $RUNNER_TEMP/enterprise.p12
-          security import $RUNNER_TEMP/enterprise.p12 \
+
+          # Convert modern AES-256 encrypted p12 to legacy format
+          # macOS security command only supports the older legacy encryption format
+          openssl pkcs12 \
+            -in $RUNNER_TEMP/enterprise.p12 \
+            -passin pass:"$ENTERPRISE_CERT_PASSWORD" \
+            -passout pass:"$ENTERPRISE_CERT_PASSWORD" \
+            -out $RUNNER_TEMP/enterprise_legacy.p12 \
+            -legacy
+
+          # Import the converted legacy p12 into keychain
+          security import $RUNNER_TEMP/enterprise_legacy.p12 \
             -k "$KEYCHAIN_PATH" \
             -P "$ENTERPRISE_CERT_PASSWORD" \
             -T /usr/bin/codesign
