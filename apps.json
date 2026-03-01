@@ -14,15 +14,15 @@
       "bundleIdentifier": "com.kdt.livecontainer",
       "developerName": "LiveContainer Team",
       "subtitle": "Run iOS apps without actually installing them!",
-      "version": "3.6.1",
-      "versionDate": "2025-08-19",
-      "versionDescription": "\u26a0\ufe0fThis version \u26a0\ufe0fREQUIRES\u26a0\ufe0f SideStore 0.6.2+ / AltStore 2.2.1+ to install.\r\n>[!Note]\r\n> This a minor release that solves the following issues in version 3.6.0 and adds the following features. For more information, please see [3.6.0 release note](https://github.com/LiveContainer/LiveContainer/releases/tag/3.6.0).\r \n\u2022 Fixed an issue where symbol offset caches were not reset after an iOS update, causing crashes. Fixes 765 757 760  \r\n\u2022 Fixed a bug where window controls could appear behind the status bar if the app was terminated while in full-screen mode with the dock hidden. Fixes 742  \r\n\u2022 Fixed an issue preventing the built-in SideStore from deactivating apps. Fixes 725  \r\n\u2022 Fixed a problem where LiveContainer failed to locate certain symbols in dyld on iPad 7 running iOS 18.6. Fixes 746  \r\n\u2022 Fixed a crash that could occur when LiveContainer attempted to check if another instance of LiveContainer was running. Fixes 751  \r\n\u2022 Fixed an issue where LiveContainer tries to open private app in another LiveContainer if an app is running in the primary LiveContainer.\r \nNew Features\r\n\u2022 On iPad, LiveContainer will now only open a new window in full-screen mode if LiveContainer itself is already in full-screen mode.  \r\n\u2022 The \"Fix File Picker and Local Notifications\" option has been split into three separate options: Fix File Picker, Fix Local Notifications, and Use LiveContainer's Bundle ID. Implements 739  \r \nLocalization\r\n\u2022 Updated translations: Arabic, Japanese, Polish, and Brazilian Portuguese.  \r\n\u2022 Added Korean translation, contributed by @Dr-Sauce.  ",
-      "downloadURL": "https://github.com/LiveContainer/LiveContainer/releases/download/3.6.1/LiveContainer.ipa",
+      "version": "3.7.2",
+      "versionDate": "2026-02-27",
+      "versionDescription": "> [!Warning]\r\n> The standalone version requires SideStore 0.6.2+ or AltStore 2.2.1+ for installation.\r\n> To install LiveContainer with built-in SideStore (LiveContainer+SideStore.ipa), please use [Impactor](https://github.com/khcrysalis/Impactor) or [iloader](https://github.com/nab138/iloader). See [our installation guide](https://livecontainer.github.io/docs/installation/lc_sidestore) for details.\r \n>[!Note]\r\n> This a minor release that solves the following issues in version 3.7.0 and adds the following features. For more information, please see [3.7.0 release note](https://github.com/LiveContainer/LiveContainer/releases/tag/3.7.0).\r \nBug Fixes\r \n\u2022 Fix an issue where built-in SideStore may freeze on launch (1158)\r\n\u2022 Fix the ipa of another LiveContainer not generating in LiveContainer+SideStore builds after SideStore's massive codebase change (1184)\r\n\u2022 Fix the new Launch App Shortcut does not work below iOS 18 (1159)\r\n\u2022 The Launch App Shortcut now reports meaningful errors\r\n\u2022 Fix crash when using external container in multitasking mode\r\n\u2022 Fix process hangs when debugging multitask private apps\r \nNew Features\r\n\u2022 The \"Tap top of the view to scroll to top\" action can be passed through to multitasking guest apps.",
+      "downloadURL": "https://github.com/LiveContainer/LiveContainer/releases/download/3.7.2/LiveContainer.ipa",
       "localizedDescription": "Run iOS apps without actually installing them!",
       "iconURL": "https://raw.githubusercontent.com/LiveContainer/LiveContainer/main/screenshots/AppIcon1024.png",
       "tintColor": "#0784FC",
       "category": "utilities",
-      "size": 4232092,
+      "size": 4523860,
       "screenshotURLs": [
         "https://raw.githubusercontent.com/LiveContainer/LiveContainer/main/screenshots/1.png"
       ],
@@ -79,6 +79,13 @@
         }
       },
       "versions": [
+        {
+          "version": "3.7.2",
+          "date": "2026-02-27",
+          "localizedDescription": "> [!Warning]\r\n> The standalone version requires SideStore 0.6.2+ or AltStore 2.2.1+ for installation.\r\n> To install LiveContainer with built-in SideStore (LiveContainer+SideStore.ipa), please use [Impactor](https://github.com/khcrysalis/Impactor) or [iloader](https://github.com/nab138/iloader). See [our installation guide](https://livecontainer.github.io/docs/installation/lc_sidestore) for details.\r \n>[!Note]\r\n> This a minor release that solves the following issues in version 3.7.0 and adds the following features. For more information, please see [3.7.0 release note](https://github.com/LiveContainer/LiveContainer/releases/tag/3.7.0).\r \nBug Fixes\r \n\u2022 Fix an issue where built-in SideStore may freeze on launch (1158)\r\n\u2022 Fix the ipa of another LiveContainer not generating in LiveContainer+SideStore builds after SideStore's massive codebase change (1184)\r\n\u2022 Fix the new Launch App Shortcut does not work below iOS 18 (1159)\r\n\u2022 The Launch App Shortcut now reports meaningful errors\r\n\u2022 Fix crash when using external container in multitasking mode\r\n\u2022 Fix process hangs when debugging multitask private apps\r \nNew Features\r\n\u2022 The \"Tap top of the view to scroll to top\" action can be passed through to multitasking guest apps.",
+          "downloadURL": "https://github.com/LiveContainer/LiveContainer/releases/download/3.7.2/LiveContainer.ipa",
+          "size": 4523860
+        },
         {
           "version": "3.6.1",
           "date": "2025-08-19",
@@ -280,6 +287,17 @@
       "tintColor": "#0784FC",
       "title": "3.6.1 - LiveContainer  19/08/25",
       "url": "https://github.com/LiveContainer/LiveContainer/releases/tag/3.6.1"
+    },
+    {
+      "appID": "com.kdt.livecontainer",
+      "caption": "Update of LiveContainer just got released!",
+      "date": "2026-02-27T04:18:41Z",
+      "identifier": "release-3.7.2",
+      "imageURL": "https://raw.githubusercontent.com/LiveContainer/LiveContainer/main/screenshots/release.png",
+      "notify": true,
+      "tintColor": "#0784FC",
+      "title": "3.7.2 - LiveContainer  27/02/26",
+      "url": "https://github.com/LiveContainer/LiveContainer/releases/tag/3.7.2"
     }
   ]
 }
