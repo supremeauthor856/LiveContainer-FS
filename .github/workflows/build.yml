@@ -40,7 +40,7 @@ jobs:
         run: |
           set -e
 
-          echo "🔹 Creating temporary keychain..."
+          echo "ð¹ Creating temporary keychain..."
           KEYCHAIN=$RUNNER_TEMP/build.keychain
           KEYCHAIN_PASSWORD=$(openssl rand -base64 16)
 
@@ -49,10 +49,10 @@ jobs:
           security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
           security list-keychains -d user -s "$KEYCHAIN"
 
-          echo "🔹 Decoding certificate..."
+          echo "ð¹ Decoding certificate..."
           echo "$P12_BASE64" | base64 --decode > $RUNNER_TEMP/original.p12
 
-          echo "🔹 Converting to legacy-compatible P12..."
+          echo "ð¹ Converting to legacy-compatible P12..."
           openssl pkcs12 -in $RUNNER_TEMP/original.p12 \
             -passin pass:"$P12_PASSWORD" \
             -out $RUNNER_TEMP/temp.pem -nodes
@@ -65,7 +65,7 @@ jobs:
             -certpbe PBE-SHA1-3DES \
             -macalg SHA1
 
-          echo "🔹 Importing certificate into keychain..."
+          echo "ð¹ Importing certificate into keychain..."
           security import $RUNNER_TEMP/legacy.p12 \
             -k "$KEYCHAIN" \
             -P "$P12_PASSWORD" \
@@ -77,11 +77,11 @@ jobs:
             -S apple-tool:,apple:,codesign: \
             -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
 
-          echo "🔹 Finding signing identity..."
+          echo "ð¹ Finding signing identity..."
           IDENTITY=$(security find-identity -v -p codesigning "$KEYCHAIN" | head -n1 | awk '{print $2}')
           echo "SIGNING IDENTITY: $IDENTITY"
 
-          echo "🔹 Decoding provisioning profile..."
+          echo "ð¹ Decoding provisioning profile..."
           echo "$PROFILE_BASE64" | base64 --decode > $RUNNER_TEMP/profile.mobileprovision
 
           UUID=$(/usr/libexec/PlistBuddy -c "Print :UUID" /dev/stdin <<< "$(security cms -D -i $RUNNER_TEMP/profile.mobileprovision)")
@@ -101,41 +101,53 @@ jobs:
       # -------------------------------------------------
       # Build LiveContainer Archive (No Auto-Sign)
       # -------------------------------------------------
-      - name: Build Archive
+      - name: Build LiveContainer Archive
+        if: github.event_name == 'workflow_dispatch' && github.event.inputs.signing_method == 'enterprise'
         run: |
-          set -o pipefail
-          mkdir -p build
-          xcodebuild clean archive \
-            -project LiveContainer.xcodeproj \
-            -scheme LiveContainer \
+          set -e
+          xcodebuild -scheme LiveContainer \
             -configuration Release \
-            -sdk iphoneos \
             -destination generic/platform=iOS \
             -archivePath build/LiveContainer.xcarchive \
-            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGN_IDENTITY="" \
             CODE_SIGNING_REQUIRED=NO \
-            2>&1 | tee build.log || (echo "❌ Xcode archive failed" && exit 1)
+            CODE_SIGN_ENTITLEMENTS="" \
+            PROVISIONING_PROFILE_SPECIFIER="" \
+            ENABLE_BITCODE=NO \
+            archive
 
       # -------------------------------------------------
-      # Enterprise Re-sign LiveContainer
+      # Enterprise Re-sign LiveContainer (FIXED)
       # -------------------------------------------------
       - name: Re-sign LiveContainer
         if: github.event_name == 'workflow_dispatch' && github.event.inputs.signing_method == 'enterprise'
         run: |
+          set -e
           APP=build/LiveContainer.xcarchive/Products/Applications/LiveContainer.app
 
-          echo "🔹 Embedding provisioning profile..."
+          echo "ð¹ Embedding provisioning profile..."
           cp $RUNNER_TEMP/profile.mobileprovision $APP/embedded.mobileprovision
           /usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier $BUNDLE_ID" $APP/Info.plist
 
-          echo "🔹 Signing frameworks and dylibs..."
+          echo "ð¹ Listing available identities..."
+          security find-identity -v -p codesigning "$KEYCHAIN"
+
+          echo "ð¹ Attempting to extract first valid identity..."
+          IDENTITY=$(security find-identity -v -p codesigning "$KEYCHAIN" | grep -E "Apple Distribution|iPhone Distribution|Developer ID Application" | head -n1 | awk '{print $2}')
+          if [ -z "$IDENTITY" ]; then
+            echo "â No valid signing identity found. Check if certificate contains private key."
+            exit 1
+          fi
+          echo "â Using identity: $IDENTITY"
+
+          echo "ð¹ Signing frameworks and dylibs..."
           find $APP -name "*.framework" -o -name "*.dylib" | while read item; do
             codesign --force --sign "$IDENTITY" \
               --keychain "$KEYCHAIN" \
               --timestamp=none "$item"
           done
 
-          echo "🔹 Signing main app..."
+          echo "ð¹ Signing main app..."
           codesign --force --sign "$IDENTITY" \
             --keychain "$KEYCHAIN" \
             --entitlements <(security cms -D -i $RUNNER_TEMP/profile.mobileprovision | plutil -extract Entitlements xml1 -o - -) \
@@ -144,17 +156,43 @@ jobs:
           codesign --verify --deep --strict "$APP"
 
       # -------------------------------------------------
-      # Package IPA for Distribution
+      # Export IPA
       # -------------------------------------------------
-      - name: Create IPA
+      - name: Export IPA
+        if: github.event_name == 'workflow_dispatch' && github.event.inputs.signing_method == 'enterprise'
         run: |
-          mkdir Payload
-          cp -R build/LiveContainer.xcarchive/Products/Applications/LiveContainer.app Payload/
-          zip -r LiveContainer.ipa Payload
-          rm -rf Payload
+          set -e
+          xcodebuild -exportArchive \
+            -archivePath build/LiveContainer.xcarchive \
+            -exportOptionsPlist <(cat <<EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>method</key>
+            <string>enterprise</string>
+            <key>provisioningProfiles</key>
+            <dict>
+              <key>$BUNDLE_ID</key>
+              <string>$UUID</string>
+            </dict>
+            <key>signingStyle</key>
+            <string>manual</string>
+            <key>teamID</key>
+            <string>$TEAM_ID</string>
+          </dict>
+          </plist>
+          EOF
+          ) \
+            -exportPath build/LiveContainer-Exported
 
-      - name: Upload IPA Artifact
+      # -------------------------------------------------
+      # Upload Artifact
+      # -------------------------------------------------
+      - name: Upload Artifact
+        if: github.event_name == 'workflow_dispatch' && github.event.inputs.signing_method == 'enterprise'
         uses: actions/upload-artifact@v4
         with:
-          name: LiveContainer.ipa
-          path: LiveContainer.ipa
+          name: LiveContainer-enterprise.ipa
+          path: build/LiveContainer-Exported/LiveContainer.ipa
+          retention-days: 7
