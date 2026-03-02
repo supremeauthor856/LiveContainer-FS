@@ -1,4 +1,4 @@
-name: Build LiveContainer IPA
+name: Hardened LiveContainer Enterprise Build
 
 on:
   workflow_dispatch:
@@ -11,11 +11,11 @@ on:
         options:
           - enterprise
           - unsigned
-  pull_request:
 
 jobs:
   build:
     runs-on: macos-14
+    timeout-minutes: 60
 
     steps:
       - name: Checkout
@@ -28,8 +28,8 @@ jobs:
         with:
           xcode-version: "16.2"
 
-      - name: Import Enterprise Certificate
-        if: github.event_name == 'workflow_dispatch' && github.event.inputs.signing_method == 'enterprise'
+      - name: Import Enterprise Certificate (Hardened)
+        if: github.event.inputs.signing_method == 'enterprise'
         env:
           P12_BASE64: ${{ secrets.ENTERPRISE_CERT_P12 }}
           P12_PASSWORD: ${{ secrets.ENTERPRISE_CERT_PASSWORD }}
@@ -45,9 +45,13 @@ jobs:
           security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
           security list-keychains -d user -s "$KEYCHAIN"
 
-          echo "$P12_BASE64" | base64 --decode > $RUNNER_TEMP/cert.p12
+          echo "$P12_BASE64" | base64 --decode > $RUNNER_TEMP/original.p12
 
-          security import $RUNNER_TEMP/cert.p12             -k "$KEYCHAIN"             -P "$P12_PASSWORD"             -T /usr/bin/codesign             -T /usr/bin/security             -A
+          openssl pkcs12 -in $RUNNER_TEMP/original.p12             -passin pass:"$P12_PASSWORD"             -out $RUNNER_TEMP/temp.pem -nodes
+
+          openssl pkcs12 -export             -in $RUNNER_TEMP/temp.pem             -passout pass:"$P12_PASSWORD"             -out $RUNNER_TEMP/legacy.p12             -keypbe PBE-SHA1-3DES             -certpbe PBE-SHA1-3DES             -macalg SHA1
+
+          security import $RUNNER_TEMP/legacy.p12             -k "$KEYCHAIN"             -P "$P12_PASSWORD"             -T /usr/bin/codesign             -T /usr/bin/security             -A
 
           security set-key-partition-list             -S apple-tool:,apple:,codesign:             -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
 
@@ -68,27 +72,35 @@ jobs:
           mkdir -p ~/Library/MobileDevice/Provisioning\ Profiles
           cp $RUNNER_TEMP/profile.mobileprovision             ~/Library/MobileDevice/Provisioning\ Profiles/$UUID.mobileprovision
 
-      - name: Build Archive
+      - name: Build Archive (Fail-Safe Mode)
         run: |
           set -o pipefail
 
-          xcodebuild clean archive             -project LiveContainer.xcodeproj             -scheme LiveContainer             -configuration Release             -sdk iphoneos             -destination generic/platform=iOS             -archivePath build/LiveContainer.xcarchive             CODE_SIGNING_ALLOWED=NO             CODE_SIGNING_REQUIRED=NO             2>&1 | tee build.log
+          xcodebuild clean archive             -project LiveContainer.xcodeproj             -scheme LiveContainer             -configuration Release             -sdk iphoneos             -destination generic/platform=iOS             -archivePath build/LiveContainer.xcarchive             CODE_SIGNING_ALLOWED=NO             CODE_SIGNING_REQUIRED=NO             DEVELOPMENT_TEAM=""             2>&1 | tee build.log
 
-      - name: Re-sign App
-        if: github.event_name == 'workflow_dispatch' && github.event.inputs.signing_method == 'enterprise'
+          EXIT_CODE=${PIPESTATUS[0]}
+
+          if [ $EXIT_CODE -ne 0 ]; then
+            echo "========== ERROR LINES =========="
+            grep -i "error:" build.log | tail -50 || true
+            echo "========== LAST 100 LINES =========="
+            tail -100 build.log
+            exit $EXIT_CODE
+          fi
+
+      - name: Re-sign App (Deep Safe)
+        if: github.event.inputs.signing_method == 'enterprise'
         run: |
           APP=build/LiveContainer.xcarchive/Products/Applications/LiveContainer.app
-
-          cp $RUNNER_TEMP/profile.mobileprovision $APP/embedded.mobileprovision
-          /usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier $BUNDLE_ID" $APP/Info.plist
-
           IDENTITY=$(security find-identity -v -p codesigning "$KEYCHAIN" | head -n1 | awk '{print $2}')
 
-          find $APP -name "*.framework" -o -name "*.dylib" | while read item; do
+          cp $RUNNER_TEMP/profile.mobileprovision $APP/embedded.mobileprovision
+
+          find $APP -type f \( -name "*.framework" -o -name "*.dylib" \) | while read item; do
             codesign --force --sign "$IDENTITY"               --keychain "$KEYCHAIN"               --timestamp=none               "$item"
           done
 
-          codesign --force --sign "$IDENTITY"             --keychain "$KEYCHAIN"             --entitlements <(security cms -D -i $RUNNER_TEMP/profile.mobileprovision | plutil -extract Entitlements xml1 -o - -)             --timestamp=none             "$APP"
+          codesign --force --sign "$IDENTITY"             --keychain "$KEYCHAIN"             --deep             --timestamp=none             "$APP"
 
           codesign --verify --deep --strict "$APP"
 
@@ -102,5 +114,5 @@ jobs:
       - name: Upload IPA
         uses: actions/upload-artifact@v4
         with:
-          name: LiveContainer.ipa
+          name: LiveContainer-Enterprise.ipa
           path: LiveContainer.ipa
