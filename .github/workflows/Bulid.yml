@@ -1,4 +1,4 @@
-name: LiveContainer Enterprise Build
+name: LiveContainer-FS Enterprise Build
 
 on:
   workflow_dispatch:
@@ -11,267 +11,455 @@ on:
         options:
           - enterprise
           - unsigned
-  pull_request:
 
 jobs:
   build:
     runs-on: macos-14
-    timeout-minutes: 60
+    timeout-minutes: 30
 
     steps:
-
-      # ─────────────────────────────────────────
-      # 1. CHECKOUT
-      # ─────────────────────────────────────────
+      # ============================================
+      # CHECKOUT
+      # ============================================
       - name: Checkout Repository
         uses: actions/checkout@v4
         with:
           submodules: recursive
+          fetch-depth: 0
 
-      # ─────────────────────────────────────────
-      # 2. XCODE SETUP
-      # ─────────────────────────────────────────
+      # ============================================
+      # XCODE SETUP
+      # ============================================
       - name: Setup Xcode
         uses: maxim-lobanov/setup-xcode@v1
         with:
           xcode-version: "16.2"
 
-      # ─────────────────────────────────────────
-      # 3. IMPORT ENTERPRISE CERTIFICATE
-      # Fixes: MAC verification failed, Unknown format,
-      #        no identity found, keychain conflicts
-      # ─────────────────────────────────────────
-      - name: Import Enterprise Certificate
-        if: github.event_name == 'workflow_dispatch' && github.event.inputs.signing_method == 'enterprise'
-        env:
-          P12_BASE64: ${{ secrets.ENTERPRISE_CERT_P12 }}
-          P12_PASSWORD: ${{ secrets.ENTERPRISE_CERT_PASSWORD }}
-          PROFILE_BASE64: ${{ secrets.ENTERPRISE_PROVISIONING_PROFILE }}
+      # ============================================
+      # DETECT PROJECT STRUCTURE
+      # ============================================
+      - name: Detect Project and Scheme
+        id: detect
         run: |
           set -e
 
-          echo "🔹 Creating temporary keychain..."
-          KEYCHAIN=$RUNNER_TEMP/build.keychain
-          KEYCHAIN_PASSWORD=$(openssl rand -base64 16)
-
-          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
-          security set-keychain-settings -lut 21600 "$KEYCHAIN"
-          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
-          security list-keychains -d user -s "$KEYCHAIN"
-
-          echo "🔹 Decoding certificate (stripping formatting artifacts)..."
-          # tr -d removes line breaks/spaces that corrupt base64 from tools like base64.guru
-          echo "$P12_BASE64" | tr -d '\n\r ' | base64 --decode > "$RUNNER_TEMP/original.p12"
-
-          if [ ! -s "$RUNNER_TEMP/original.p12" ]; then
-            echo "❌ Certificate file is empty after decoding — check ENTERPRISE_CERT_P12 secret"
+          if ls *.xcworkspace 1>/dev/null 2>&1; then
+            WORKSPACE=$(ls -d *.xcworkspace | head -n1)
+            echo "project_type=workspace" >> $GITHUB_OUTPUT
+            echo "project_path=$WORKSPACE" >> $GITHUB_OUTPUT
+            echo "Found workspace: $WORKSPACE"
+          elif ls *.xcodeproj 1>/dev/null 2>&1; then
+            PROJECT=$(ls -d *.xcodeproj | head -n1)
+            echo "project_type=project" >> $GITHUB_OUTPUT
+            echo "project_path=$PROJECT" >> $GITHUB_OUTPUT
+            echo "Found project: $PROJECT"
+          else
+            echo "❌ No .xcodeproj or .xcworkspace found"
+            ls -la
             exit 1
           fi
 
-          echo "🔹 Converting to legacy-compatible P12 (fixes MAC verification on modern exports)..."
-          openssl pkcs12 \
-            -in "$RUNNER_TEMP/original.p12" \
-            -passin pass:"$P12_PASSWORD" \
-            -out "$RUNNER_TEMP/temp.pem" \
-            -nodes -legacy 2>/dev/null || \
-          openssl pkcs12 \
-            -in "$RUNNER_TEMP/original.p12" \
-            -passin pass:"$P12_PASSWORD" \
-            -out "$RUNNER_TEMP/temp.pem" \
-            -nodes
+          echo "Available schemes:"
+          if [ -n "${WORKSPACE:-}" ]; then
+            xcodebuild -workspace "$WORKSPACE" -list 2>/dev/null || true
+          elif [ -n "${PROJECT:-}" ]; then
+            xcodebuild -project "$PROJECT" -list 2>/dev/null || true
+          fi
 
-          openssl pkcs12 \
-            -export \
-            -in "$RUNNER_TEMP/temp.pem" \
-            -passout pass:"$P12_PASSWORD" \
-            -out "$RUNNER_TEMP/legacy.p12" \
+          SCHEME=""
+          for candidate in "LiveContainer" "LiveContainerFS" "LiveContainer-FS"; do
+            if [ -n "${WORKSPACE:-}" ]; then
+              if xcodebuild -workspace "$WORKSPACE" -list 2>/dev/null | grep -q "$candidate"; then
+                SCHEME="$candidate"
+                break
+              fi
+            elif [ -n "${PROJECT:-}" ]; then
+              if xcodebuild -project "$PROJECT" -list 2>/dev/null | grep -q "$candidate"; then
+                SCHEME="$candidate"
+                break
+              fi
+            fi
+          done
+
+          if [ -z "$SCHEME" ]; then
+            SCHEME=$(find . -path "*/xcshareddata/xcschemes/*.xcscheme" -exec basename {} .xcscheme \; | head -n1)
+          fi
+
+          if [ -z "$SCHEME" ]; then
+            echo "❌ No scheme found"
+            find . -path "*/xcshareddata/xcschemes/*.xcscheme" -exec basename {} .xcscheme \;
+            exit 1
+          fi
+
+          echo "scheme=$SCHEME" >> $GITHUB_OUTPUT
+          echo "✅ Using scheme: $SCHEME"
+
+      # ============================================
+      # ENTERPRISE CERTIFICATE IMPORT
+      # ============================================
+      - name: Import Enterprise Certificate
+        if: inputs.signing_method == 'enterprise'
+        env:
+          CERT_BASE64: ${{ secrets.ENTERPRISE_CERT_P12 }}
+          CERT_PASSWORD: ${{ secrets.ENTERPRISE_CERT_PASSWORD }}
+        run: |
+          set -e
+
+          if [ -z "$CERT_BASE64" ]; then
+            echo "❌ ENTERPRISE_CERT_P12 secret is empty"
+            exit 1
+          fi
+          if [ -z "$CERT_PASSWORD" ]; then
+            echo "❌ ENTERPRISE_CERT_PASSWORD secret is empty"
+            exit 1
+          fi
+
+          echo "🔹 Decoding certificate..."
+          echo "$CERT_BASE64" | tr -d '\n\r \t' | base64 --decode > $RUNNER_TEMP/original.p12
+
+          if [ ! -s $RUNNER_TEMP/original.p12 ]; then
+            echo "❌ Decoded certificate is empty"
+            exit 1
+          fi
+
+          echo "�� Size: $(wc -c < $RUNNER_TEMP/original.p12) bytes"
+          file $RUNNER_TEMP/original.p12
+
+          echo "🔹 Converting to legacy PKCS12..."
+          openssl pkcs12 -in $RUNNER_TEMP/original.p12 \
+            -passin pass:"$CERT_PASSWORD" \
+            -out $RUNNER_TEMP/temp.pem \
+            -nodes 2>&1 || {
+              echo "❌ OpenSSL failed — wrong password or corrupt file"
+              exit 1
+            }
+
+          openssl pkcs12 -export \
+            -in $RUNNER_TEMP/temp.pem \
+            -passout pass:"$CERT_PASSWORD" \
+            -out $RUNNER_TEMP/legacy.p12 \
             -keypbe PBE-SHA1-3DES \
             -certpbe PBE-SHA1-3DES \
             -macalg SHA1
 
-          echo "🔹 Importing certificate into keychain..."
-          security import "$RUNNER_TEMP/legacy.p12" \
+          if [ ! -s $RUNNER_TEMP/legacy.p12 ]; then
+            echo "❌ Legacy P12 conversion failed"
+            exit 1
+          fi
+
+          echo "🔹 Creating keychain..."
+          KEYCHAIN="$RUNNER_TEMP/build.keychain-db"
+          KEYCHAIN_PASSWORD=$(openssl rand -hex 16)
+
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security list-keychains -d user -s "$KEYCHAIN" $(security list-keychains -d user | tr -d '"')
+          security default-keychain -s "$KEYCHAIN"
+
+          echo "🔹 Importing certificate..."
+          security import $RUNNER_TEMP/legacy.p12 \
             -k "$KEYCHAIN" \
-            -P "$P12_PASSWORD" \
+            -P "$CERT_PASSWORD" \
             -T /usr/bin/codesign \
             -T /usr/bin/security \
+            -T /usr/bin/productbuild \
             -A
 
           security set-key-partition-list \
             -S apple-tool:,apple:,codesign: \
             -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
 
-          echo "🔹 Verifying signing identity..."
+          echo "🔹 Checking identities..."
           security find-identity -v -p codesigning "$KEYCHAIN"
 
-          IDENTITY=$(security find-identity -v -p codesigning "$KEYCHAIN" | head -n1 | awk '{print $2}')
-          if [ -z "$IDENTITY" ]; then
-            echo "❌ No signing identity found — certificate may lack private key or is expired"
-            exit 1
-          fi
-          echo "✅ Identity found: $IDENTITY"
+          IDENTITY_HASH=$(security find-identity -v -p codesigning "$KEYCHAIN" | grep -E "^[[:space:]]+[0-9]+" | head -n1 | awk '{print $2}')
 
-          echo "🔹 Decoding provisioning profile..."
-          echo "$PROFILE_BASE64" | tr -d '\n\r ' | base64 --decode > "$RUNNER_TEMP/profile.mobileprovision"
-
-          if [ ! -s "$RUNNER_TEMP/profile.mobileprovision" ]; then
-            echo "❌ Provisioning profile is empty — check ENTERPRISE_PROVISIONING_PROFILE secret"
+          if [ -z "$IDENTITY_HASH" ]; then
+            echo "❌ No signing identity found"
             exit 1
           fi
 
-          PROFILE_DATA=$(security cms -D -i "$RUNNER_TEMP/profile.mobileprovision")
+          IDENTITY_NAME=$(security find-identity -v -p codesigning "$KEYCHAIN" | grep -E "^[[:space:]]+[0-9]+" | head -n1 | sed 's/.*"\(.*\)".*/\1/')
 
-          UUID=$(/usr/libexec/PlistBuddy -c "Print :UUID" /dev/stdin <<< "$PROFILE_DATA")
-          TEAM_ID=$(/usr/libexec/PlistBuddy -c "Print :TeamIdentifier:0" /dev/stdin <<< "$PROFILE_DATA")
-          APP_ID=$(/usr/libexec/PlistBuddy -c "Print :Entitlements:application-identifier" /dev/stdin <<< "$PROFILE_DATA")
-          BUNDLE_ID="${APP_ID#*.}"
+          echo "✅ Identity: $IDENTITY_NAME ($IDENTITY_HASH)"
 
-          echo "✅ UUID:      $UUID"
-          echo "✅ TEAM_ID:   $TEAM_ID"
-          echo "✅ BUNDLE_ID: $BUNDLE_ID"
+          echo "IDENTITY_HASH=$IDENTITY_HASH" >> $GITHUB_ENV
+          echo "IDENTITY_NAME=$IDENTITY_NAME" >> $GITHUB_ENV
+          echo "KEYCHAIN=$KEYCHAIN" >> $GITHUB_ENV
+          echo "KEYCHAIN_PASSWORD=$KEYCHAIN_PASSWORD" >> $GITHUB_ENV
 
-          echo "UUID=$UUID"           >> "$GITHUB_ENV"
-          echo "TEAM_ID=$TEAM_ID"     >> "$GITHUB_ENV"
-          echo "BUNDLE_ID=$BUNDLE_ID" >> "$GITHUB_ENV"
-          echo "KEYCHAIN=$KEYCHAIN"   >> "$GITHUB_ENV"
-          echo "KEYCHAIN_PASSWORD=$KEYCHAIN_PASSWORD" >> "$GITHUB_ENV"
-          echo "IDENTITY=$IDENTITY"   >> "$GITHUB_ENV"
-
-          echo "🔹 Installing provisioning profile..."
-          mkdir -p ~/Library/MobileDevice/Provisioning\ Profiles
-          cp "$RUNNER_TEMP/profile.mobileprovision" \
-            ~/Library/MobileDevice/Provisioning\ Profiles/"$UUID.mobileprovision"
-
-      # ─────────────────────────────────────────
-      # 4. BUILD ARCHIVE
-      # Fixes: exit code 65, auto-sign conflicts,
-      #        missing project flag
-      # ─────────────────────────────────────────
-      - name: Build Archive
+      # ============================================
+      # INSTALL PROVISIONING PROFILE
+      # ============================================
+      - name: Install Provisioning Profile
+        if: inputs.signing_method == 'enterprise'
+        env:
+          PROFILE_BASE64: ${{ secrets.ENTERPRISE_PROVISIONING_PROFILE }}
         run: |
-          set -o pipefail
-          mkdir -p build
+          set -e
 
-          echo "🔹 Starting Xcode archive..."
-          xcodebuild clean archive \
-            -project LiveContainer.xcodeproj \
-            -scheme LiveContainer \
+          if [ -z "$PROFILE_BASE64" ]; then
+            echo "❌ ENTERPRISE_PROVISIONING_PROFILE secret is empty"
+            exit 1
+          fi
+
+          echo "$PROFILE_BASE64" | tr -d '\n\r \t' | base64 --decode > $RUNNER_TEMP/profile.mobileprovision
+
+          if [ ! -s $RUNNER_TEMP/profile.mobileprovision ]; then
+            echo "❌ Decoded profile is empty"
+            exit 1
+          fi
+
+          security cms -D -i $RUNNER_TEMP/profile.mobileprovision > $RUNNER_TEMP/profile_decoded.plist 2>/dev/null || {
+            echo "❌ Failed to decode profile"
+            exit 1
+          }
+
+          UUID=$(/usr/libexec/PlistBuddy -c "Print :UUID" $RUNNER_TEMP/profile_decoded.plist)
+          TEAM_ID=$(/usr/libexec/PlistBuddy -c "Print :TeamIdentifier:0" $RUNNER_TEMP/profile_decoded.plist)
+          APP_ID_FULL=$(/usr/libexec/PlistBuddy -c "Print :Entitlements:application-identifier" $RUNNER_TEMP/profile_decoded.plist)
+          PROFILE_NAME=$(/usr/libexec/PlistBuddy -c "Print :Name" $RUNNER_TEMP/profile_decoded.plist)
+          BUNDLE_ID="${APP_ID_FULL#*.}"
+
+          echo "✅ Profile: $PROFILE_NAME"
+          echo "✅ UUID: $UUID"
+          echo "✅ Team: $TEAM_ID"
+          echo "✅ Bundle ID: $BUNDLE_ID"
+
+          mkdir -p "$HOME/Library/MobileDevice/Provisioning Profiles"
+          cp $RUNNER_TEMP/profile.mobileprovision \
+            "$HOME/Library/MobileDevice/Provisioning Profiles/$UUID.mobileprovision"
+
+          echo "UUID=$UUID" >> $GITHUB_ENV
+          echo "TEAM_ID=$TEAM_ID" >> $GITHUB_ENV
+          echo "BUNDLE_ID=$BUNDLE_ID" >> $GITHUB_ENV
+          echo "APP_ID_FULL=$APP_ID_FULL" >> $GITHUB_ENV
+          echo "PROFILE_NAME=$PROFILE_NAME" >> $GITHUB_ENV
+
+      # ============================================
+      # CLEAN
+      # ============================================
+      - name: Clean
+        run: rm -rf build DerivedData
+
+      # ============================================
+      # ARCHIVE — ENTERPRISE
+      # ============================================
+      - name: Archive (Enterprise)
+        if: inputs.signing_method == 'enterprise'
+        env:
+          SCHEME: ${{ steps.detect.outputs.scheme }}
+          PROJECT_TYPE: ${{ steps.detect.outputs.project_type }}
+          PROJECT_PATH: ${{ steps.detect.outputs.project_path }}
+        run: |
+          set -eo pipefail
+
+          if [ "$PROJECT_TYPE" = "workspace" ]; then
+            PROJECT_FLAG="-workspace"
+          else
+            PROJECT_FLAG="-project"
+          fi
+
+          echo "🔹 Building $SCHEME..."
+
+          xcodebuild \
+            $PROJECT_FLAG "$PROJECT_PATH" \
+            -scheme "$SCHEME" \
             -configuration Release \
             -sdk iphoneos \
             -destination "generic/platform=iOS" \
             -archivePath build/LiveContainer.xcarchive \
+            -derivedDataPath DerivedData \
+            clean archive \
+            CODE_SIGN_STYLE=Manual \
+            CODE_SIGN_IDENTITY="$IDENTITY_NAME" \
+            DEVELOPMENT_TEAM="$TEAM_ID" \
+            PROVISIONING_PROFILE_SPECIFIER="$PROFILE_NAME" \
+            PRODUCT_BUNDLE_IDENTIFIER="$BUNDLE_ID" \
+            OTHER_CODE_SIGN_FLAGS="--keychain $KEYCHAIN" \
+            2>&1 | tee build.log
+
+          if [ ! -d "build/LiveContainer.xcarchive" ]; then
+            echo "❌ Archive failed"
+            tail -50 build.log
+            exit 1
+          fi
+
+          echo "✅ Archive created"
+
+      # ============================================
+      # ARCHIVE — UNSIGNED
+      # ============================================
+      - name: Archive (Unsigned)
+        if: inputs.signing_method == 'unsigned'
+        env:
+          SCHEME: ${{ steps.detect.outputs.scheme }}
+          PROJECT_TYPE: ${{ steps.detect.outputs.project_type }}
+          PROJECT_PATH: ${{ steps.detect.outputs.project_path }}
+        run: |
+          set -eo pipefail
+
+          if [ "$PROJECT_TYPE" = "workspace" ]; then
+            PROJECT_FLAG="-workspace"
+          else
+            PROJECT_FLAG="-project"
+          fi
+
+          xcodebuild \
+            $PROJECT_FLAG "$PROJECT_PATH" \
+            -scheme "$SCHEME" \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination "generic/platform=iOS" \
+            -archivePath build/LiveContainer.xcarchive \
+            -derivedDataPath DerivedData \
+            clean archive \
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGN_IDENTITY="" \
             2>&1 | tee build.log
 
-          EXIT_CODE=${PIPESTATUS[0]}
-          if [ "$EXIT_CODE" -ne 0 ]; then
-            echo "❌ Xcode archive failed with exit code $EXIT_CODE"
-            echo "--- Last 60 lines of build log ---"
-            tail -60 build.log
-            exit "$EXIT_CODE"
-          fi
-
-          echo "✅ Archive succeeded"
-
-      # ─────────────────────────────────────────
-      # 5. RE-SIGN APP (Enterprise only)
-      # Fixes: missing embedded profile, wrong sign order,
-      #        frameworks not signed before main app
-      # ─────────────────────────────────────────
-      - name: Re-sign App
-        if: github.event_name == 'workflow_dispatch' && github.event.inputs.signing_method == 'enterprise'
-        run: |
-          set -e
-          APP="build/LiveContainer.xcarchive/Products/Applications/LiveContainer.app"
-
-          if [ ! -d "$APP" ]; then
-            echo "❌ App not found at $APP — archive may have failed"
+          if [ ! -d "build/LiveContainer.xcarchive" ]; then
+            echo "❌ Archive failed"
+            tail -50 build.log
             exit 1
           fi
 
-          echo "🔹 Embedding provisioning profile..."
-          cp "$RUNNER_TEMP/profile.mobileprovision" "$APP/embedded.mobileprovision"
+          echo "✅ Unsigned archive created"
 
-          echo "🔹 Updating bundle ID..."
-          /usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier $BUNDLE_ID" "$APP/Info.plist"
+      # ============================================
+      # DIAGNOSE ARCHIVE
+      # ============================================
+      - name: Diagnose Archive
+        if: always()
+        run: |
+          if [ -d "build/LiveContainer.xcarchive" ]; then
+            echo "🔹 Archive contents:"
+            find build/LiveContainer.xcarchive/Products -type f -name "*.app" -o -name "*.framework" -o -name "*.dylib" -o -name "*.appex" 2>/dev/null | head -30
 
-          echo "🔹 Extracting entitlements from profile..."
-          ENTITLEMENTS_FILE="$RUNNER_TEMP/entitlements.plist"
-          security cms -D -i "$RUNNER_TEMP/profile.mobileprovision" \
-            | plutil -extract Entitlements xml1 -o "$ENTITLEMENTS_FILE" -
+            APP_PATH=$(find build/LiveContainer.xcarchive/Products -name "*.app" -type d | head -n1)
+            if [ -n "$APP_PATH" ]; then
+              echo "🔹 Bundle ID:"
+              /usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier" "$APP_PATH/Info.plist" 2>/dev/null || echo "Unknown"
+              echo "🔹 Executable:"
+              /usr/libexec/PlistBuddy -c "Print :CFBundleExecutable" "$APP_PATH/Info.plist" 2>/dev/null || echo "Unknown"
+              echo "🔹 Signature:"
+              codesign -dvv "$APP_PATH" 2>&1 || echo "Not signed"
+            fi
+          else
+            echo "⚠️ No archive"
+            if [ -f build.log ]; then
+              tail -100 build.log
+            fi
+          fi
 
-          echo "🔹 Signing dylibs..."
-          find "$APP" -name "*.dylib" | while read item; do
-            codesign --force --sign "$IDENTITY" \
-              --keychain "$KEYCHAIN" \
-              --timestamp=none \
-              "$item"
-          done
-
-          echo "🔹 Signing frameworks..."
-          find "$APP" -name "*.framework" | while read item; do
-            codesign --force --sign "$IDENTITY" \
-              --keychain "$KEYCHAIN" \
-              --timestamp=none \
-              "$item"
-          done
-
-          echo "🔹 Signing app extensions..."
-          find "$APP" -name "*.appex" | while read item; do
-            codesign --force --sign "$IDENTITY" \
-              --keychain "$KEYCHAIN" \
-              --entitlements "$ENTITLEMENTS_FILE" \
-              --timestamp=none \
-              "$item"
-          done
-
-          echo "🔹 Signing main app bundle (last)..."
-          codesign --force --sign "$IDENTITY" \
-            --keychain "$KEYCHAIN" \
-            --entitlements "$ENTITLEMENTS_FILE" \
-            --timestamp=none \
-            "$APP"
-
-          echo "🔹 Verifying signature..."
-          codesign --verify --deep --strict --verbose=2 "$APP"
-          echo "✅ Signature verified"
-
-      # ─────────────────────────────────────────
-      # 6. PACKAGE IPA
-      # ─────────────────────────────────────────
+      # ============================================
+      # PACKAGE IPA (Clean for WSF re-signing)
+      # ============================================
       - name: Create IPA
         run: |
           set -e
-          echo "🔹 Packaging IPA..."
-          mkdir -p Payload
-          cp -R "build/LiveContainer.xcarchive/Products/Applications/LiveContainer.app" Payload/
-          zip -r LiveContainer.ipa Payload
-          rm -rf Payload
 
-          if [ ! -f LiveContainer.ipa ]; then
-            echo "❌ IPA file not created"
+          APP_PATH=$(find build/LiveContainer.xcarchive/Products/Applications -name "*.app" -type d | head -n1)
+
+          if [ -z "$APP_PATH" ]; then
+            echo "❌ No .app found in archive"
+            find build/LiveContainer.xcarchive/ -type d | head -30
             exit 1
           fi
 
-          echo "✅ IPA created: $(du -h LiveContainer.ipa | cut -f1)"
+          APP_NAME=$(basename "$APP_PATH")
+          echo "✅ Found app: $APP_NAME"
 
-      # ─────────────────────────────────────────
-      # 7. UPLOAD ARTIFACT
-      # ─────────────────────────────────────────
+          echo "🔹 Bundle ID:"
+          /usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier" "$APP_PATH/Info.plist"
+          echo "🔹 Executable:"
+          /usr/libexec/PlistBuddy -c "Print :CFBundleExecutable" "$APP_PATH/Info.plist"
+          echo "🔹 Minimum OS:"
+          /usr/libexec/PlistBuddy -c "Print :MinimumOSVersion" "$APP_PATH/Info.plist" 2>/dev/null || echo "Not set"
+          echo "🔹 Supported platforms:"
+          /usr/libexec/PlistBuddy -c "Print :CFBundleSupportedPlatforms" "$APP_PATH/Info.plist" 2>/dev/null || echo "Not set"
+
+          # Strip ALL code signatures so WSF can sign cleanly
+          echo "🔹 Stripping all code signatures..."
+          find "$APP_PATH" -name "_CodeSignature" -type d -exec rm -rf {} + 2>/dev/null || true
+          find "$APP_PATH" -name "CodeResources" -delete 2>/dev/null || true
+
+          # Remove ALL embedded provisioning profiles — WSF injects its own
+          echo "🔹 Removing all provisioning profiles..."
+          find "$APP_PATH" -name "embedded.mobileprovision" -delete 2>/dev/null || true
+
+          # List app extensions
+          echo "🔹 App extensions:"
+          find "$APP_PATH" -name "*.appex" -type d 2>/dev/null || echo "None"
+
+          # List frameworks
+          echo "🔹 Frameworks:"
+          find "$APP_PATH" -name "*.framework" -type d 2>/dev/null || echo "None"
+
+          # List dylibs
+          echo "🔹 Dynamic libraries:"
+          find "$APP_PATH" -name "*.dylib" 2>/dev/null || echo "None"
+
+          # Package IPA
+          mkdir -p Payload
+          cp -R "$APP_PATH" Payload/
+          zip -r build/LiveContainer.ipa Payload -x "*.DS_Store"
+          rm -rf Payload
+
+          echo "✅ IPA ready for WSF signing"
+          echo "🔹 Size: $(du -h build/LiveContainer.ipa | awk '{print $1}')"
+
+      # ============================================
+      # VERIFY IPA
+      # ============================================
+      - name: Verify IPA
+        run: |
+          IPA=$(find build -name "*.ipa" | head -n1)
+          if [ -z "$IPA" ]; then
+            echo "❌ No IPA found"
+            ls -laR build/
+            exit 1
+          fi
+
+          echo "✅ IPA: $IPA"
+          echo "🔹 Size: $(du -h "$IPA" | awk '{print $1}')"
+
+          unzip -t "$IPA" > /dev/null 2>&1 || {
+            echo "❌ IPA is corrupt"
+            exit 1
+          }
+
+          echo "✅ IPA is valid"
+
+      # ============================================
+      # UPLOAD
+      # ============================================
       - name: Upload IPA
         uses: actions/upload-artifact@v4
         with:
-          name: LiveContainer.ipa
-          path: LiveContainer.ipa
+          name: LiveContainer-IPA
+          path: build/LiveContainer.ipa
+          if-no-files-found: error
 
-      # ─────────────────────────────────────────
-      # 8. CLEANUP (always runs)
-      # ─────────────────────────────────────────
-      - name: Cleanup Keychain
+      - name: Upload Build Log (on failure)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs
+          path: |
+            build.log
+            export.log
+          if-no-files-found: ignore
+
+      # ============================================
+      # CLEANUP
+      # ============================================
+      - name: Cleanup
         if: always()
         run: |
-          security delete-keychain "$RUNNER_TEMP/build.keychain" 2>/dev/null || true
-          rm -f "$RUNNER_TEMP/original.p12" "$RUNNER_TEMP/temp.pem" "$RUNNER_TEMP/legacy.p12" 2>/dev/null || true
-          echo "🔹 Keychain and temp files cleaned up"
+          if [ -n "${KEYCHAIN:-}" ] && [ -f "${KEYCHAIN}" ]; then
+            security delete-keychain "$KEYCHAIN" 2>/dev/null || true
+          fi
+          rm -f $RUNNER_TEMP/original.p12 $RUNNER_TEMP/legacy.p12 $RUNNER_TEMP/temp.pem 2>/dev/null || true
