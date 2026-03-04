@@ -56,158 +56,71 @@ jobs:
           echo "scheme=$SCHEME" >> $GITHUB_OUTPUT
           echo "Using scheme: $SCHEME"
 
-      # ============================================
-      # PATCH: Bypass development certificate check
-      # ============================================
       - name: Patch Development Certificate Check
         run: |
           set -e
-          echo "🔹 Searching for development certificate check in source..."
+          echo "Searching for development certificate check..."
 
-          # Find all Swift files that contain the certificate check
-          FOUND=0
+          echo "=== Files containing get-task-allow ==="
+          grep -rn "get-task-allow" --include="*.swift" --include="*.m" --include="*.mm" . || echo "None"
 
-          # Search for common patterns used in LiveContainer
-          grep -rn "get-task-allow" --include="*.swift" --include="*.m" --include="*.mm" . || true
-          grep -rn "isDevCert\|devCert\|isDeveloper\|developmentCert" --include="*.swift" --include="*.m" . || true
-          grep -rn "not signed with a development" --include="*.swift" --include="*.m" . || true
-          grep -rn "won't work at all" --include="*.swift" --include="*.m" . || true
-          grep -rn "development certificate" --include="*.swift" --include="*.m" . || true
-          grep -rn "CODE_SIGNING\|SigningInfo\|signingInfo\|certCheck\|checkSign" --include="*.swift" --include="*.m" . || true
+          echo "=== Files containing development certificate error ==="
+          grep -rn "not signed with a development" --include="*.swift" --include="*.m" . || echo "None"
+
+          echo "=== Files containing cert check variables ==="
+          grep -rn "isDevCert\|isDev\|devCert\|isDevelop" --include="*.swift" --include="*.m" . || echo "None"
+
+          echo "=== Files containing task allow check ==="
+          grep -rn "taskAllow\|task_allow\|getTaskAllow" --include="*.swift" --include="*.m" . || echo "None"
 
           echo ""
-          echo "🔹 Patching all certificate validation checks..."
+          echo "Applying patches..."
 
-          # Method 1: Patch LCUtils if it exists
-          # This handles the entitlement check
-          find . -name "LCUtils.swift" -o -name "LCUtils.m" -o -name "LCUtils.mm" | while read file; do
-            echo "Patching: $file"
-            # Replace any get-task-allow check to always return true
-            sed -i '' 's/SecTaskCopyValueForEntitlement.*get-task-allow.*/true as CFBoolean/g' "$file" 2>/dev/null || true
-            # Replace any isDevCert = false with true
-            sed -i '' 's/isDevCert = false/isDevCert = true/g' "$file" 2>/dev/null || true
-            sed -i '' 's/isDevelopment = false/isDevelopment = true/g' "$file" 2>/dev/null || true
-          done
+          find . -name "*.swift" -type f | while read file; do
+            CHANGED=0
 
-          # Method 2: Patch any Swift file with the error message
-          find . -name "*.swift" | while read file; do
             if grep -q "not signed with a development" "$file" 2>/dev/null; then
-              echo "Found certificate check in: $file"
-              
-              # Comment out the entire if block that shows the error
-              # Replace the check condition to always pass
-              sed -i '' '/not signed with a development/,/}/s/^/\/\/ PATCHED: /' "$file" 2>/dev/null || true
-              
-              echo "Patched: $file"
+              echo "Patching error message in: $file"
+              sed -i '' 's/isDevCert = false/isDevCert = true/g' "$file"
+              sed -i '' 's/isDevelopment = false/isDevelopment = true/g' "$file"
+              sed -i '' 's/devCert = false/devCert = true/g' "$file"
+              sed -i '' 's/isDev = false/isDev = true/g' "$file"
+              CHANGED=1
             fi
 
-            if grep -q "won't work at all" "$file" 2>/dev/null; then
-              echo "Found secondary check in: $file"
-              sed -i '' '/won'"'"'t work at all/,/}/s/^/\/\/ PATCHED: /' "$file" 2>/dev/null || true
+            if grep -q "get-task-allow" "$file" 2>/dev/null; then
+              echo "Patching get-task-allow check in: $file"
+              sed -i '' 's/\["get-task-allow"\] as? Bool ?? false/true/g' "$file"
+              sed -i '' 's/\["get-task-allow"\] as? Bool/true as? Bool/g' "$file"
+              sed -i '' 's/value(forKey: "get-task-allow") as? Bool ?? false/true/g' "$file"
+              sed -i '' 's/object(forKey: "get-task-allow") as? Bool ?? false/true/g' "$file"
+              sed -i '' 's/bool(forKey: "get-task-allow")/true/g' "$file"
+              CHANGED=1
+            fi
+
+            if [ "$CHANGED" = "1" ]; then
               echo "Patched: $file"
             fi
           done
 
-          # Method 3: Patch Objective-C files
           find . -name "*.m" -o -name "*.mm" | while read file; do
             if grep -q "get-task-allow" "$file" 2>/dev/null; then
-              echo "Found entitlement check in: $file"
-              # Make the check always return YES/true
-              sed -i '' 's/\[\[entitlements objectForKey:@"get-task-allow"\] boolValue\]/YES/g' "$file" 2>/dev/null || true
-              sed -i '' 's/entitlements\[@"get-task-allow"\]/\@YES/g' "$file" 2>/dev/null || true
+              echo "Patching ObjC file: $file"
+              sed -i '' 's/objectForKey:@"get-task-allow"\] boolValue\]/YES/g' "$file"
+              sed -i '' 's/\[@"get-task-allow"\]/@YES/g' "$file"
               echo "Patched: $file"
             fi
           done
 
-          # Method 4: Direct string replacement approach
-          # Find the exact file and line with the error
-          ERROR_FILES=$(grep -rln "not signed with a development certificate" --include="*.swift" --include="*.m" --include="*.mm" . 2>/dev/null || true)
-          
-          for file in $ERROR_FILES; do
-            echo "🔹 Direct patching: $file"
-            echo "Before patch:"
-            grep -n "development certificate" "$file" || true
-            
-            # Strategy: Find the function containing this error and make it return early
-            # Replace the entire conditional block
-            python3 << PYEOF
-import re
-
-with open("$file", "r") as f:
-    content = f.read()
-
-# Pattern 1: Remove/bypass the dev cert check entirely
-# Look for if statements that lead to the error message
-patterns = [
-    # Swift patterns
-    (r'if\s+!.*(?:isDevCert|isDev|getTaskAllow|get.task.allow).*\{[^}]*(?:not signed with a development|won\'t work)[^}]*\}', '// DEV CERT CHECK BYPASSED'),
-    (r'guard\s+.*(?:isDevCert|isDev|getTaskAllow|get.task.allow).*else\s*\{[^}]*(?:not signed with a development|won\'t work)[^}]*\}', '// DEV CERT CHECK BYPASSED'),
-    # Make any boolean check for dev cert return true
-    (r'(let\s+\w*[Dd]ev\w*)\s*=\s*false', r'\1 = true'),
-    (r'(var\s+\w*[Dd]ev\w*)\s*=\s*false', r'\1 = true'),
-]
-
-for pattern, replacement in patterns:
-    content = re.sub(pattern, replacement, content, flags=re.DOTALL)
-
-with open("$file", "w") as f:
-    f.write(content)
-
-print("Python patch applied")
-PYEOF
-            
-            echo "After patch:"
-            grep -n "development certificate\|DEV CERT CHECK\|PATCHED" "$file" || true
-          done
-
-          # Method 5: Nuclear option - find and patch the specific check function
           echo ""
-          echo "🔹 Searching for the signing validation function..."
-          
-          # Look for common LiveContainer signing check patterns
-          grep -rn "func.*check.*sign\|func.*valid.*cert\|func.*isDev\|func.*getTaskAllow" --include="*.swift" . || true
-          grep -rn "taskAllow\|task_allow\|getTaskAllow" --include="*.swift" --include="*.m" . || true
-
-          # If there's a specific LCEntitlements or signing check file
-          find . -name "*Entitlement*" -o -name "*Signing*" -o -name "*Certificate*" | grep -E "\.(swift|m|mm|h)$" | while read file; do
-            echo "Found signing-related file: $file"
-            cat "$file" | head -50
-          done
-
-          echo ""
-          echo "🔹 Final verification - checking all patched files..."
-          grep -rn "PATCHED\|BYPASSED" --include="*.swift" --include="*.m" . || echo "No explicit patches found - trying alternate approach"
-
-          # Method 6: If nothing else worked, create an override
-          # Add a category/extension that overrides the check
-          LCUTILS_SWIFT=$(find . -name "LCUtils.swift" | head -n1)
-          if [ -n "$LCUTILS_SWIFT" ]; then
-            echo ""
-            echo "🔹 Adding override to LCUtils.swift..."
-            # Check what's actually in LCUtils
-            echo "=== LCUtils.swift contents (first 100 lines) ==="
-            head -100 "$LCUTILS_SWIFT"
-            echo "=== End ==="
-          fi
-
-          # Method 7: Patch Info.plist to add a flag LiveContainer might check
-          find . -name "Info.plist" -path "*/LiveContainer/*" | while read plist; do
-            echo "Checking: $plist"
-            /usr/libexec/PlistBuddy -c "Add :LCForceDevMode bool true" "$plist" 2>/dev/null || true
-          done
-
-          echo ""
-          echo "✅ Patching complete"
-          echo ""
-          echo "🔹 Summary of all Swift files mentioning certificates or signing:"
-          grep -rln "certificate\|signing\|entitlement\|get-task-allow" --include="*.swift" . 2>/dev/null || echo "None found"
+          echo "Patch complete"
 
       - name: Show Patched Source
         run: |
-          echo "🔹 Files modified by patch:"
+          echo "Files modified:"
           git diff --name-only
           echo ""
-          echo "🔹 Full diff:"
+          echo "Full diff:"
           git diff
 
       - name: Clean
@@ -266,14 +179,10 @@ PYEOF
             exit 1
           fi
 
-          echo "Found app: $(basename "$APP_PATH")"
-
-          # Strip signatures
           find "$APP_PATH" -name "_CodeSignature" -type d -exec rm -rf {} + 2>/dev/null || true
           find "$APP_PATH" -name "CodeResources" -delete 2>/dev/null || true
           find "$APP_PATH" -name "embedded.mobileprovision" -delete 2>/dev/null || true
 
-          # Package
           mkdir -p Payload
           cp -R "$APP_PATH" Payload/
           zip -r build/LiveContainer.ipa Payload -x "*.DS_Store"
