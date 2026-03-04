@@ -9,150 +9,51 @@ jobs:
     timeout-minutes: 45
 
     steps:
-      - name: Checkout Repository
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Fix and Initialize All Submodules
+      - name: Clone Original LiveContainer
         run: |
           set -e
+          echo "=== Cloning original LiveContainer with all submodules ==="
 
-          echo "=== .gitmodules content ==="
-          cat .gitmodules || echo "No .gitmodules"
+          git clone --recursive https://github.com/khanhduytran0/LiveContainer.git source 2>&1 || {
+            echo "Failed to clone original repo"
+            echo "Trying LiveContainer-FS forks..."
 
-          echo ""
-          echo "=== Current submodule status ==="
-          git submodule status || true
-
-          echo ""
-          echo "=== Converting SSH to HTTPS ==="
-          if [ -f .gitmodules ]; then
-            sed -i '' 's|git@github.com:|https://github.com/|g' .gitmodules
-            sed -i '' 's|ssh://git@github.com/|https://github.com/|g' .gitmodules
-            echo "Updated .gitmodules:"
-            cat .gitmodules
-          fi
-
-          echo ""
-          echo "=== Syncing ==="
-          git submodule sync --recursive
-
-          echo ""
-          echo "=== Initializing ==="
-          git submodule init
-
-          echo ""
-          echo "=== Updating (force) ==="
-          git submodule update --init --recursive --force 2>&1 || {
-            echo ""
-            echo "Standard update failed. Trying manual clone..."
-
-            git submodule foreach --recursive 'echo "Submodule: $name at $toplevel/$sm_path"' 2>/dev/null || true
-
-            while IFS= read -r line; do
-              path=$(echo "$line" | sed -n 's/.*path = //p' | tr -d '[:space:]')
-              url=$(echo "$line" | sed -n 's/.*url = //p' | tr -d '[:space:]')
-
-              if [ -n "$path" ] && [ -n "$url" ]; then
-                echo ""
-                echo "Handling submodule: $path -> $url"
-
-                if [ ! -d "$path" ] || [ -z "$(ls -A "$path" 2>/dev/null)" ]; then
-                  echo "Directory empty or missing, cloning..."
-                  rm -rf "$path"
-                  git clone --recursive "$url" "$path" 2>&1 || {
-                    echo "Clone failed for $url"
-                    echo "Trying without recursive..."
-                    git clone "$url" "$path" 2>&1 || echo "FAILED: Could not clone $url"
-                  }
-                else
-                  echo "Directory exists with files"
-                fi
-              fi
-            done < .gitmodules
+            git clone --recursive https://github.com/LiveContainerFS/LiveContainer-FS.git source 2>&1 || {
+              echo "Trying another source..."
+              git clone --recursive https://github.com/Starter4ik/LiveContainer-FS.git source 2>&1 || {
+                echo "All clone attempts failed"
+                exit 1
+              }
+            }
           }
 
           echo ""
-          echo "=== Final submodule status ==="
+          echo "=== Repo contents ==="
+          ls -la source/
+
+          echo ""
+          echo "=== Submodule status ==="
+          cd source
           git submodule status --recursive || true
-
-          echo ""
-          echo "=== Root directory listing ==="
-          ls -la
-
-          echo ""
-          echo "=== Checking critical directories ==="
-          for dir in LiveContainerUI LiveContainerSwiftUI Resources; do
-            if [ -d "$dir" ]; then
-              count=$(find "$dir" -type f | wc -l)
-              echo "$dir: EXISTS ($count files)"
-              ls "$dir"/ | head -10
-            else
-              echo "$dir: MISSING"
-            fi
-          done
 
           echo ""
           echo "=== All directories ==="
           find . -maxdepth 2 -type d | sort
 
           echo ""
-          echo "=== All Swift files ==="
-          find . -name "*.swift" -type f | head -50
+          echo "=== Swift file count ==="
+          find . -name "*.swift" -type f | wc -l
 
-      - name: Verify Source Files Exist
-        run: |
-          set -e
-          MISSING=0
-
-          if [ ! -f "LiveContainerUI/LCAppModel.swift" ]; then
-            echo "MISSING: LiveContainerUI/LCAppModel.swift"
-            MISSING=1
-          fi
-
-          if [ ! -f "LiveContainerUI/LCWebView.swift" ]; then
-            echo "MISSING: LiveContainerUI/LCWebView.swift"
-            MISSING=1
-          fi
-
-          if [ "$MISSING" = "1" ]; then
-            echo ""
-            echo "Critical source files are missing."
-            echo "LiveContainerUI directory contents:"
-            ls -la LiveContainerUI/ 2>/dev/null || echo "Directory does not exist"
-            echo ""
-            echo "This means the LiveContainerUI submodule failed to clone."
-            echo "Checking if it is a private repo..."
-            
-            SUBMODULE_URL=$(grep -A2 "LiveContainerUI" .gitmodules | grep url | sed 's/.*= //' | tr -d '[:space:]')
-            echo "Submodule URL: $SUBMODULE_URL"
-            
-            echo ""
-            echo "Attempting direct clone of submodule..."
-            rm -rf LiveContainerUI
-            git clone "$SUBMODULE_URL" LiveContainerUI 2>&1 || {
-              echo ""
-              echo "FAILED to clone $SUBMODULE_URL"
-              echo ""
-              echo "This submodule is either:"
-              echo "1. A private repository (needs access token)"
-              echo "2. The URL is wrong"
-              echo "3. The repo was deleted"
-              echo ""
-              echo "To fix this, you need to either:"
-              echo "- Make the submodule repo public"
-              echo "- Add a GitHub token with access"
-              echo "- Or copy the source files directly into this repo"
-              exit 1
-            }
-
-            echo ""
-            echo "LiveContainerUI after clone:"
-            ls -la LiveContainerUI/
-          else
-            echo "All critical source files exist"
-          fi
+          echo ""
+          echo "=== Key directories ==="
+          for dir in LiveContainerUI LiveContainerSwiftUI Resources LiveContainerShared; do
+            if [ -d "$dir" ]; then
+              count=$(find "$dir" -type f | wc -l)
+              echo "$dir: EXISTS ($count files)"
+            else
+              echo "$dir: not present"
+            fi
+          done
 
       - name: Setup Xcode
         uses: maxim-lobanov/setup-xcode@v1
@@ -161,8 +62,13 @@ jobs:
 
       - name: Detect Project and Scheme
         id: detect
+        working-directory: source
         run: |
           set -e
+
+          echo "=== Project files ==="
+          ls -la *.xcodeproj *.xcworkspace 2>/dev/null || echo "None found at root"
+
           if ls *.xcworkspace 1>/dev/null 2>&1; then
             PROJECT_PATH=$(ls -d *.xcworkspace | head -n1)
             echo "project_flag=-workspace" >> $GITHUB_OUTPUT
@@ -171,13 +77,24 @@ jobs:
             echo "project_flag=-project" >> $GITHUB_OUTPUT
           else
             echo "No project found"
+            ls -la
             exit 1
           fi
           echo "project_path=$PROJECT_PATH" >> $GITHUB_OUTPUT
 
+          echo ""
+          echo "=== Available schemes ==="
+          xcodebuild -project "$PROJECT_PATH" -list 2>/dev/null || \
+          xcodebuild -workspace "$PROJECT_PATH" -list 2>/dev/null || \
+          echo "Could not list schemes"
+
           SCHEME=""
           for candidate in "LiveContainer" "LiveContainerFS" "LiveContainer-FS"; do
             if xcodebuild -project "$PROJECT_PATH" -list 2>/dev/null | grep -q "$candidate"; then
+              SCHEME="$candidate"
+              break
+            fi
+            if xcodebuild -workspace "$PROJECT_PATH" -list 2>/dev/null | grep -q "$candidate"; then
               SCHEME="$candidate"
               break
             fi
@@ -189,31 +106,44 @@ jobs:
 
           if [ -z "$SCHEME" ]; then
             echo "No scheme found"
+            echo "Shared schemes:"
+            find . -path "*/xcshareddata/xcschemes/*.xcscheme" -exec basename {} .xcscheme \;
             exit 1
           fi
 
           echo "scheme=$SCHEME" >> $GITHUB_OUTPUT
           echo "Using scheme: $SCHEME"
+          echo "Using project: $PROJECT_PATH"
 
       - name: Patch Development Certificate Check
+        working-directory: source
         run: |
           set -e
-          echo "Searching for development certificate check..."
+          echo "=== Searching for certificate checks ==="
 
-          echo "=== Files containing get-task-allow ==="
+          echo "--- get-task-allow ---"
           grep -rn "get-task-allow" --include="*.swift" --include="*.m" --include="*.mm" . || echo "None"
 
-          echo "=== Files containing development certificate error ==="
+          echo "--- development certificate error ---"
           grep -rn "not signed with a development" --include="*.swift" --include="*.m" . || echo "None"
 
-          echo "=== Files containing cert check ==="
-          grep -rn "isDevCert\|isDev\|devCert\|isDevelop\|certificatePassword\|checkCert" --include="*.swift" --include="*.m" . || echo "None"
+          echo "--- dev cert variables ---"
+          grep -rn "isDevCert\|isDev\|devCert\|isDevelop" --include="*.swift" --include="*.m" . || echo "None"
 
-          echo "=== Files containing task allow ==="
-          grep -rn "taskAllow\|task_allow\|getTaskAllow\|get.task.allow" --include="*.swift" --include="*.m" . || echo "None"
+          echo "--- task allow ---"
+          grep -rn "taskAllow\|task_allow\|getTaskAllow" --include="*.swift" --include="*.m" . || echo "None"
+
+          echo "--- certificate check functions ---"
+          grep -rn "func.*check.*sign\|func.*valid.*cert\|func.*signing" --include="*.swift" . || echo "None"
+
+          echo "--- LCUtils content (first 200 lines) ---"
+          for f in $(find . -name "LCUtils.m" -o -name "LCUtils.swift" -o -name "LCUtils.mm"); do
+            echo "=== $f ==="
+            head -200 "$f"
+          done
 
           echo ""
-          echo "Applying patches..."
+          echo "=== Applying patches ==="
 
           find . -name "*.swift" -type f | while read file; do
             CHANGED=0
@@ -247,31 +177,35 @@ jobs:
               echo "Patching ObjC: $file"
               sed -i '' 's/objectForKey:@"get-task-allow"\] boolValue\]/YES/g' "$file"
               sed -i '' 's/\[@"get-task-allow"\]/@YES/g' "$file"
+              sed -i '' 's/boolForKey:@"get-task-allow"\]/YES/g' "$file"
               echo "Patched: $file"
             fi
           done
 
           echo ""
-          echo "Patch complete"
+          echo "=== Patch summary ==="
+          git diff --stat || echo "No tracked changes (expected for fresh clone)"
 
-      - name: Show Patched Source
+      - name: Show All Changes
+        working-directory: source
         run: |
-          echo "Files modified:"
-          git diff --name-only
-          echo ""
-          echo "Full diff:"
-          git diff || echo "No changes"
+          echo "=== Full diff ==="
+          git diff || echo "No diff available"
 
       - name: Clean
+        working-directory: source
         run: rm -rf build DerivedData
 
       - name: Build Archive
+        working-directory: source
         env:
           SCHEME: ${{ steps.detect.outputs.scheme }}
           PROJECT_FLAG: ${{ steps.detect.outputs.project_flag }}
           PROJECT_PATH: ${{ steps.detect.outputs.project_path }}
         run: |
           set -eo pipefail
+          echo "Building $SCHEME from $PROJECT_PATH..."
+
           xcodebuild \
             $PROJECT_FLAG "$PROJECT_PATH" \
             -scheme "$SCHEME" \
@@ -290,19 +224,21 @@ jobs:
             2>&1 | tee build.log
 
           if [ ! -d "build/LiveContainer.xcarchive" ]; then
-            echo "Archive failed"
             echo ""
-            echo "=== Errors ==="
-            grep -i "error:" build.log | tail -30
+            echo "=== ARCHIVE FAILED ==="
+            echo ""
+            echo "=== All errors ==="
+            grep -i "error:" build.log | grep -v "warning" | tail -30
             echo ""
             echo "=== Last 50 lines ==="
             tail -50 build.log
             exit 1
           fi
-          echo "Archive created"
+          echo "Archive created successfully"
 
       - name: Diagnose Archive
         if: always()
+        working-directory: source
         run: |
           if [ -d "build/LiveContainer.xcarchive" ]; then
             APP_PATH=$(find build/LiveContainer.xcarchive/Products -name "*.app" -type d | head -n1)
@@ -311,15 +247,19 @@ jobs:
               /usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier" "$APP_PATH/Info.plist" 2>/dev/null || true
               /usr/libexec/PlistBuddy -c "Print :CFBundleExecutable" "$APP_PATH/Info.plist" 2>/dev/null || true
               /usr/libexec/PlistBuddy -c "Print :MinimumOSVersion" "$APP_PATH/Info.plist" 2>/dev/null || true
-              find "$APP_PATH" -name "*.appex" -type d 2>/dev/null || true
-              find "$APP_PATH" -name "*.framework" -type d 2>/dev/null || true
-              find "$APP_PATH" -name "*.dylib" 2>/dev/null || true
+              echo "Extensions:"
+              find "$APP_PATH" -name "*.appex" -type d 2>/dev/null || echo "None"
+              echo "Frameworks:"
+              find "$APP_PATH" -name "*.framework" -type d 2>/dev/null || echo "None"
+              echo "Dylibs:"
+              find "$APP_PATH" -name "*.dylib" 2>/dev/null || echo "None"
             fi
           else
-            echo "No archive created"
+            echo "No archive"
           fi
 
       - name: Create IPA
+        working-directory: source
         run: |
           set -e
           APP_PATH=$(find build/LiveContainer.xcarchive/Products/Applications -name "*.app" -type d | head -n1)
@@ -327,6 +267,8 @@ jobs:
             echo "No .app found"
             exit 1
           fi
+
+          echo "Packaging: $(basename "$APP_PATH")"
 
           find "$APP_PATH" -name "_CodeSignature" -type d -exec rm -rf {} + 2>/dev/null || true
           find "$APP_PATH" -name "CodeResources" -delete 2>/dev/null || true
@@ -340,6 +282,7 @@ jobs:
           echo "IPA size: $(du -h build/LiveContainer.ipa | awk '{print $1}')"
 
       - name: Verify IPA
+        working-directory: source
         run: |
           unzip -t build/LiveContainer.ipa > /dev/null 2>&1 || {
             echo "IPA corrupt"
@@ -351,7 +294,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: LiveContainer-IPA
-          path: build/LiveContainer.ipa
+          path: source/build/LiveContainer.ipa
           if-no-files-found: error
 
       - name: Upload Build Log
@@ -359,5 +302,5 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: build-logs
-          path: build.log
+          path: source/build.log
           if-no-files-found: ignore
